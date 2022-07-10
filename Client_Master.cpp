@@ -132,6 +132,16 @@ void accept_request(int sock){
     cout << buf << endl;
 }
 
+void change_admin(int sock){
+    char dum[5];
+    strcpy(dum, "test");
+    write(sock, dum, 5);
+
+    char buf[96];
+    read(sock, buf, 96);
+    cout << buf << endl;
+}
+
 void leave_group(int sock){
     write_log("waiting for response");
     char buf[96];
@@ -379,7 +389,7 @@ int connect_to_tracker(int trackerNum, struct sockaddr_in &serv_addr, int sock){
     write_log("connected to server " + to_string(curTrackPort));
     return 0;
 }
-
+ 
 int process_tracker_command(vector<string> inpt, int sock){
     char server_reply[10240]; 
     bzero(server_reply, 10240);
@@ -447,6 +457,9 @@ int process_tracker_command(vector<string> inpt, int sock){
     }
     else if(inpt[0] == "accept_request"){
         accept_request(sock);
+    }
+    else if(inpt[0] == "change_admin"){
+        change_admin(sock);
     }
     else if(inpt[0] == "leave_group"){
         leave_group(sock);

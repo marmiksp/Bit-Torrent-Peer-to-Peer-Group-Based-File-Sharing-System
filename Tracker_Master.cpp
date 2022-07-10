@@ -269,6 +269,42 @@ void accept_request(vector<string> inpt, int client_socket, string client_uid){
     
 }
 
+void change_admin(vector<string> inpt, int client_socket, string client_uid){
+    // inpt - [change_admin groupid new_admin_user_id]
+    if(inpt.size() != 3){
+        write(client_socket, "Invalid argument count", 22);
+        return;
+    }
+    write(client_socket, "Changing Group Admin...", 21);
+
+    char dum[5];
+    read(client_socket, dum, 5);
+
+    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
+        write_log("inside change_admin if");
+        write(client_socket, "Invalid group ID.", 19);
+    }
+    else if(group_admins_uid.find(inpt[1])->second == client_uid){
+        // write_log("inside accept_request else if with pending list:");
+
+        if(group_members[inpt[1]].find(inpt[2]) != group_members[inpt[1]].end())
+        {
+            group_admins_uid[inpt[1]] = inpt[2];
+            write(client_socket, "Admin changed.", 14);
+        }
+        else{
+            write(client_socket, "Invalid user ID.", 17);
+        }
+    }
+    else{
+        write_log("inside change_admin else");
+        //cout << group_admins_uid.find(inpt[1])->second << " " << client_uid <<  endl;
+        write(client_socket, "You are not the admin of this group", 35);
+    }
+    
+}
+
+
 void leave_group(vector<string> inpt, int client_socket, string client_uid){
     // inpt - [leave_group groupid]
     if(inpt.size() != 2){
@@ -622,6 +658,9 @@ void handle_connection(int client_socket){
         }
         else if(inpt[0] == "accept_request"){
             accept_request(inpt, client_socket, client_uid);
+        }
+        else if(inpt[0] == "change_admin"){
+            change_admin(inpt, client_socket, client_uid);
         }
         else if(inpt[0] == "leave_group"){
             leave_group(inpt, client_socket, client_uid);

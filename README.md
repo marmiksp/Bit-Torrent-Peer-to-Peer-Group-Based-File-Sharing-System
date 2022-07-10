@@ -23,6 +23,12 @@ g++ Client_Master.cpp -o Client_Master -lssl -lcrypto -pthread
 ex: ./Client_Master 127.0.0.1:18000 tracker_info.txt
 ```
 
+## IMP Concept 
+1. Multithreading
+2. Socket Programming
+3. File IO
+4. Synchronization
+
 ## IMP Points
 
 1. Single tracker is implemented. It should always be running.

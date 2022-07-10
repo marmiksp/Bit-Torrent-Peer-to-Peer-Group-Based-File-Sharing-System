@@ -109,6 +109,10 @@ show_downloads
 stop_share ​"group_id" "file_name"
 ```
 
+15. Change Admin:
+```
+change_admin "group_id" "new_admin_uid"
+```
 ## Assumptions
 
 1. Single tracker is implemented.

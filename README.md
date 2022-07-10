@@ -113,7 +113,9 @@ stop_share ​"group_id" "file_name"
 ```
 change_admin "group_id" "new_admin_uid"
 ```
-## Assumptions
+## IMP Points
 
-1. Single tracker is implemented.
-2. Random Piece Selection Algorithm is Used.
+1. Single tracker is implemented. It should always be running.
+2. Random Piece Selection and Random peer selection Algorithm for that piece is Used for downloading chunks of file from peer.
+3. Admin of any group should change the admin to some another member of that group before leaving it.
+4. Downloading and uploading path should be absolute.  

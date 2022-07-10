@@ -23,6 +23,14 @@ g++ Client_Master.cpp -o Client_Master -lssl -lcrypto -pthread
 ex: ./Client_Master 127.0.0.1:18000 tracker_info.txt
 ```
 
+## IMP Points
+
+1. Single tracker is implemented. It should always be running.
+2. Random Piece Selection and Random peer selection Algorithm for that piece is Used for downloading chunks of file from peer.
+3. Admin of any group should change the admin to some another member of that group before leaving it.
+4. Downloading and uploading path should be absolute.  
+
+
 ## Commands
 
 1. Create user account:
@@ -113,9 +121,4 @@ stop_share ​"group_id" "file_name"
 ```
 change_admin "group_id" "new_admin_uid"
 ```
-## IMP Points
 
-1. Single tracker is implemented. It should always be running.
-2. Random Piece Selection and Random peer selection Algorithm for that piece is Used for downloading chunks of file from peer.
-3. Admin of any group should change the admin to some another member of that group before leaving it.
-4. Downloading and uploading path should be absolute.  

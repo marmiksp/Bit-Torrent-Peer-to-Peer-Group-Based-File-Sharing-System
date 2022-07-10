@@ -1,4 +1,4 @@
-# Bit-Torrent Peer-to-Peer Group Based File Sharing System
+# Mini Bit-Torrent Peer-to-Peer Group Based File Sharing System
 
 ## Prerequisites
 

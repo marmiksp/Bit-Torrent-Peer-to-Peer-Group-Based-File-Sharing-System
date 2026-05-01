@@ -1,130 +1,112 @@
-# Mini Bit-Torrent Peer-to-Peer Group Based File Sharing System
+# P2P File Sharing System (BitTorrent-style)
+
+A peer-to-peer file sharing system with group-based access control.
+
+## Features
+
+- Group-based sharing with admin controls
+- Chunk-based file transfer (512KB chunks)
+- Multi-peer parallel downloads
+- SHA1 hash verification for integrity
+- Network-ready (runs on different machines)
 
 ## Prerequisites
 
-- **Install OpenSSL library :** `sudo apt-get install openssl`
+```bash
+sudo apt-get install libssl-dev g++
+```
 
-## How to Run
+## Building
+
+```bash
+# Compile Tracker
+g++ -std=c++17 Tracker_Master.cpp -o tracker -lssl -lcrypto -pthread
+
+# Compile Client
+g++ -std=c++17 Client_Master.cpp -o client -lssl -lcrypto -pthread
+```
+
+## Running
 
 ### Start Tracker
-
-
-```
-g++ Tracker_Master.cpp -o Tracker_Master -lssl -lcrypto -pthread
-./Tracker_Master "Tracker_Info_File_Name" "Tracker_NO( 1 or 2 )"
-ex: ./Tracker_Master tracker_info.txt 1
+```bash
+./tracker <tracker_ip> <tracker_port>
+# Example: ./tracker 192.168.1.100 5000
 ```
 
-### Start Client:
-
-```
-g++ Client_Master.cpp -o Client_Master -lssl -lcrypto -pthread
-./Client_Master "IP:PORT" "Tracker_Info_File_Name"
-ex: ./Client_Master 127.0.0.1:18000 tracker_info.txt
+### Start Client
+```bash
+./client <client_ip> <client_port> <tracker_ip> <tracker_port>
+# Example: ./client 192.168.1.101 6000 192.168.1.100 5000
 ```
 
-## IMP Concept 
-1. Multithreading
-2. Socket Programming
-3. File IO
-4. Synchronization
+### Local Testing
+```bash
+# Terminal 1: Tracker
+./tracker 127.0.0.1 5000
 
-## IMP Points
+# Terminal 2: Client 1
+./client 127.0.0.1 6001 127.0.0.1 5000
 
-1. Single tracker is implemented. It should always be running.
-2. Random Piece Selection and Random peer selection Algorithm for that piece is Used for downloading chunks of file from peer.
-3. Admin of any group should change the admin to some another member of that group before leaving it.
-4. Downloading and uploading path should be absolute.  
-
+# Terminal 3: Client 2
+./client 127.0.0.1 6002 127.0.0.1 5000
+```
 
 ## Commands
 
-1. Create user account:
+### User Management
+- `create_user <username> <password>`
+- `login <username> <password>`
+- `logout`
 
-```
-create_user​ "user_id" "password"
-```
+### Group Management
+- `create_group <group_id>`
+- `join_group <group_id>`
+- `leave_group <group_id>`
+- `list_groups`
+- `list_requests <group_id>` (admin only)
+- `accept_request <group_id> <user_id>` (admin only)
+- `change_admin <group_id> <user_id>`
 
-2. Login:
+### File Operations
+- `upload_file <filepath> <group_id>`
+- `download_file <group_id> <filename> <dest_path>`
+- `list_files <group_id>`
+- `stop_share <group_id> <filename>`
+- `show_downloads`
 
-```
-login​ "user_id" "password"
-```
+### Other
+- `help`
+- `quit`
 
-3. Create Group:
+## Example Session
 
-```
-create_group​ "group_id"
-```
+```bash
+# Alice creates group and uploads file
+>> create_user alice pass123
+>> login alice pass123
+>> create_group movies
+>> upload_file /home/alice/video.mp4 movies
 
-4. Join Group:
+# Bob joins and downloads
+>> create_user bob pass456
+>> login bob pass456
+>> join_group movies
 
-```
-join_group​ "group_id"
-```
+# Alice accepts Bob
+>> accept_request movies bob
 
-5. Leave Group:
-
-```
-leave_group​ "group_id"
-```
-
-6. List pending requests:
-
-```
-list_requests ​"group_id"
-```
-
-7. Accept Group Joining Request:
-
-```
-accept_request​ "group_id" "user_id"
-```
-
-8. List All Group In Network:
-
-```
-list_groups
+# Bob downloads
+>> download_file movies video.mp4 /home/bob/downloads
 ```
 
-9. List All sharable Files In Group:
+## Technical Details
 
-```
-list_files​ "group_id"
-```
+- Chunk Size: 512 KB
+- Hash: SHA1 (chunks), SHA256 (file)
+- Protocol: TCP with send/recv
+- Threading: Multi-threaded server and downloads
 
-10. Upload File:
+## License
 
-```
-​upload_file​ "file_path" "group_id​"
-```
-
-11. Download File:​
-
-```
-download_file​ "group_id" "file_name" "destination_path"
-```
-
-12. Logout:​
-
-```
-logout
-```
-
-13. Show_downloads: ​
-
-```
-show_downloads
-```
-
-14. Stop sharing: ​
-
-```
-stop_share ​"group_id" "file_name"
-```
-
-15. Change Admin:
-```
-change_admin "group_id" "new_admin_uid"
-```
-
+MIT License

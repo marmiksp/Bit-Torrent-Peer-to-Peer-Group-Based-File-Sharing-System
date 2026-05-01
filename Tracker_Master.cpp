@@ -1,760 +1,680 @@
-#include <bits/stdc++.h>
-#include <openssl/sha.h>
-#include <sys/socket.h> 
-#include <sys/types.h> 
-#include <signal.h> 
-#include <string.h> 
-#include <unistd.h> 
-#include <arpa/inet.h> 
-#include <stdarg.h> 
-#include <errno.h> 
-#include <fcntl.h>
-#include <sys/time.h> 
-#include <sys/ioctl.h> 
-#include <netdb.h> 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <pthread.h>
-using namespace std; 
+/**
+ * Tracker Server for P2P File Sharing System
+ * 
+ * Responsibilities:
+ * - User registration and authentication
+ * - Group management (create, join, leave)
+ * - File metadata storage (seeders, hashes, sizes)
+ * - Providing seeder lists to downloaders
+ * 
+ * Usage: ./tracker <tracker_ip> <tracker_port>
+ * Example: ./tracker 192.168.1.100 5000
+ */
 
-#define TRACKER_PORT 18000
-#define ll long long int
-#define MAXLINE 4096 
-#define SA struct sockaddr 
+#include "common.h"
 
+// ==================== DATA STRUCTURES ====================
 
-// ###########################  Local Database ##############################
- 
-string log_file_name, tracker1_ip, tracker2_ip, cur_tracker_ip, seeder_file_name;
-uint16_t tracker1_port, tracker2_port, cur_tracker_port;
-unordered_map<string, string> uid_to_ip_port;
+// User credentials: username -> password
+map<string, string> users;
 
-unordered_map<string, string> login_cred;
-unordered_map<string, bool> is_logged_in;
+// User login status: username -> is_logged_in
+map<string, bool> user_logged_in;
 
-unordered_map<string, string> group_admins_uid;
-vector<string> all_group_id;
-unordered_map<string, set<string>> group_members;
-unordered_map<string, set<string>> group_pendng_requests;
+// User network address: username -> ip:port
+map<string, string> user_address;
 
-unordered_map<string, string> piece_wise_hash; 
-unordered_map<string, unordered_map<string, set<string>>> seeder_list; // groupid -> {map of filenames -> peer address}
+// Group admin: group_id -> admin_username
+map<string, string> group_admin;
 
-unordered_map<string, string> file_size;
+// Group members: group_id -> set of usernames
+map<string, set<string>> group_members;
 
-// ###########################  Local Database End ##############################
+// Pending join requests: group_id -> set of usernames
+map<string, set<string>> group_pending;
 
+// File seeders: group_id -> (filename -> set of usernames)
+map<string, map<string, set<string>>> file_seeders;
 
-// ###########################  Functionalities List ##############################
+// File metadata: filename -> size
+map<string, string> file_sizes;
 
-vector<string> get_trackerfile_Info(char*);
+// Piece hashes: filename -> concatenated hashes
+map<string, string> piece_hashes;
 
+// Whole-file hash: filename -> sha256(all_piece_hashes)
+map<string, string> file_hashes;
 
-int create_user(vector<string>);
-int login_validation(vector<string>);
+// Mutex for thread-safe operations
+mutex data_mutex;
 
+// ==================== MESSAGE PROTOCOL ====================
 
-void list_files(vector<string>, int);
-void stop_share(vector<string>, int, string);
-void leave_group(vector<string>, int, string);
-void accept_request(vector<string>, int, string);
-void list_requests(vector<string>, int, string);
-void join_group(vector<string>, int, string);
-void list_groups(vector<string>, int);
-int create_group(vector<string>, int, string);
+// Response codes
+const string OK = "OK";
+const string ERROR_PREFIX = "ERROR:";
 
-
-void downloadFile(vector<string>, int, string);
-void uploadFile(vector<string>, int, string);
-
-
-void clear_log();
-void write_log(const string &);
-bool is_path_exists(const string &s);
-vector<string> split_string(string, string);
-void* check_input(void*);
-
-
-void process_args(int, char **);
-
-
-void handle_connection(int);
-
-// ###########################  Functionalities List End ##############################
-
-
-// ###########################  Functionalities Implementation ##############################
-
-vector<string> get_trackerfile_Info(char* path){
-    fstream trackerInfoFile;
-    trackerInfoFile.open(path, ios::in);
-
-    vector<string> res;
-    if(trackerInfoFile.is_open()){
-        string t;
-        while(getline(trackerInfoFile, t)){
-            res.push_back(t);
-        }
-        trackerInfoFile.close();
-    }
-    else{
-        cout << "Tracker Info file not found.\n";
-        exit(-1);
-    }
-    return res;
+string make_response(const string& status, const string& message) {
+    return status + DELIMITER + message;
 }
 
-// ********************************************************************
-// ********************************************************************
-
-
-int create_user(vector<string> inpt){
-    string user_id = inpt[1];
-    string passwd = inpt[2];
-
-    if(login_cred.find(user_id) == login_cred.end()){
-        login_cred.insert({user_id, passwd});
-    }
-    else{
-        return -1;
-    }
-    return 0;
+string make_error(const string& message) {
+    return make_response(ERROR_PREFIX, message);
 }
 
-int login_validation(vector<string> inpt){
-    string user_id = inpt[1];
-    string passwd = inpt[2];
-
-    if(login_cred.find(user_id) == login_cred.end() || login_cred[user_id] != passwd){
-        return -1;
-    }
-
-    if(is_logged_in.find(user_id) == is_logged_in.end()){
-        is_logged_in.insert({user_id, true});
-    }
-    else{
-        if(is_logged_in[user_id]){
-            return 1;
-        }
-        else{
-            is_logged_in[user_id] = true;
-        }
-    }
-    return 0;
+string make_success(const string& message) {
+    return make_response(OK, message);
 }
 
-// ********************************************************************
-// ********************************************************************
+// ==================== USER MANAGEMENT ====================
 
-
-
-void list_groups(vector<string> inpt, int client_socket){
-    //inpt - [list_groups];
-    if(inpt.size() != 1){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    write(client_socket, "All groups:", 11);
-
-    char dum[5];
-    read(client_socket, dum, 5);
-
-    if(all_group_id.size() == 0){
-        write(client_socket, "No groups found$$", 18);
-        return;
-    }
-
-    string reply = "";
-    for(size_t i=0; i<all_group_id.size(); i++){
-        reply += all_group_id[i] + "$$";
-    }
-    write(client_socket, &reply[0], reply.length());
-}
-
-int create_group(vector<string> inpt, int client_socket, string client_uid){
-    //inpt - [create_group gid] 
-    if(inpt.size() != 2){
-        write(client_socket, "Invalid argument count", 22);
-        return -1;
-    }
-    for(auto i: all_group_id){
-        if(i == inpt[1]) return -1;
-    }
-    group_admins_uid.insert({inpt[1], client_uid});
-    all_group_id.push_back(inpt[1]);
-    group_members[inpt[1]].insert(client_uid);
-    return 0;
-}
-
-void join_group(vector<string> inpt, int client_socket, string client_uid){
-    //inpt - [join_group gid]
-    if(inpt.size() != 2){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    write_log("join_group function ..");
-
-    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
-        write(client_socket, "Invalid group ID.", 19);
-    }
-    else if(group_members[inpt[1]].find(client_uid) == group_members[inpt[1]].end()){
-        group_pendng_requests[inpt[1]].insert(client_uid);
-        write(client_socket, "Group request sent", 18);
-    }
-    else{
-        write(client_socket, "You are already in this group", 30);
+string handle_create_user(const vector<string>& args) {
+    if (args.size() != 3) {
+        return make_error("Usage: create_user <username> <password>");
     }
     
-}
-
-void list_requests(vector<string> inpt, int client_socket, string client_uid){
-    // inpt - [list_requests groupid]
-    if(inpt.size() != 2){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    write(client_socket, "Fetching group requests...", 27);
-
-    char dum[5];
-    read(client_socket, dum, 5);
-
-    write_log("hereeee");
-    if(group_admins_uid.find(inpt[1])==group_admins_uid.end() || group_admins_uid[inpt[1]] != client_uid){
-        write_log("iffff");
-        write(client_socket, "**err**", 7);
-    }
-    else if(group_pendng_requests[inpt[1]].size() == 0){
-        write(client_socket, "**er2**", 7);
-    }
-    else {
-        string reply = "";
-        write_log("pending request size: "+  to_string(group_pendng_requests[inpt[1]].size()));
-        for(auto i = group_pendng_requests[inpt[1]].begin(); i!= group_pendng_requests[inpt[1]].end(); i++){
-            reply += string(*i) + "$$";
-        }
-        write(client_socket, &reply[0], reply.length());
-        write_log("reply :" + reply);
-    }
-}
-
-void accept_request(vector<string> inpt, int client_socket, string client_uid){
-    // inpt - [accept_request groupid user_id]
-    if(inpt.size() != 3){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    write(client_socket, "Accepting request...", 21);
-
-    char dum[5];
-    read(client_socket, dum, 5);
-
-    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
-        write_log("inside accept_request if");
-        write(client_socket, "Invalid group ID.", 19);
-    }
-    else if(group_admins_uid.find(inpt[1])->second == client_uid){
-        write_log("inside accept_request else if with pending list:");
-        for(auto i: group_pendng_requests[inpt[1]]){
-            write_log(i);
-        }
-        group_pendng_requests[inpt[1]].erase(inpt[2]);
-        group_members[inpt[1]].insert(inpt[2]);
-        write(client_socket, "Request accepted.", 18);
-    }
-    else{
-        write_log("inside accept_request else");
-        //cout << group_admins_uid.find(inpt[1])->second << " " << client_uid <<  endl;
-        write(client_socket, "You are not the admin of this group", 35);
+    string username = args[1];
+    string password = args[2];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (users.find(username) != users.end()) {
+        return make_error("User already exists");
     }
     
+    users[username] = password;
+    user_logged_in[username] = false;
+    
+    log_info("User created: " + username);
+    return make_success("Account created successfully");
 }
 
-void change_admin(vector<string> inpt, int client_socket, string client_uid){
-    // inpt - [change_admin groupid new_admin_user_id]
-    if(inpt.size() != 3){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    write(client_socket, "Changing Group Admin...", 21);
-
-    char dum[5];
-    read(client_socket, dum, 5);
-
-    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
-        write_log("inside change_admin if");
-        write(client_socket, "Invalid group ID.", 19);
-    }
-    else if(group_admins_uid.find(inpt[1])->second == client_uid){
-        // write_log("inside accept_request else if with pending list:");
-
-        if(group_members[inpt[1]].find(inpt[2]) != group_members[inpt[1]].end())
-        {
-            group_admins_uid[inpt[1]] = inpt[2];
-            write(client_socket, "Admin changed.", 14);
-        }
-        else{
-            write(client_socket, "Invalid user ID.", 17);
-        }
-    }
-    else{
-        write_log("inside change_admin else");
-        //cout << group_admins_uid.find(inpt[1])->second << " " << client_uid <<  endl;
-        write(client_socket, "You are not the admin of this group", 35);
+string handle_login(const vector<string>& args, string& client_username, int client_socket) {
+    if (args.size() != 3) {
+        return make_error("Usage: login <username> <password>");
     }
     
+    string username = args[1];
+    string password = args[2];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    // Check credentials
+    if (users.find(username) == users.end() || users[username] != password) {
+        return make_error("Invalid username or password");
+    }
+    
+    // Check if already logged in
+    if (user_logged_in[username]) {
+        return make_error("User already logged in from another session");
+    }
+    
+    // Mark as logged in
+    user_logged_in[username] = true;
+    client_username = username;
+    
+    log_info("User logged in: " + username);
+    return make_success("LOGIN_OK");  // Special marker for client to send address
 }
 
-
-void leave_group(vector<string> inpt, int client_socket, string client_uid){
-    // inpt - [leave_group groupid]
-    if(inpt.size() != 2){
-        write(client_socket, "Invalid argument count", 22);
-        return;
+string handle_logout(const string& username) {
+    if (username.empty()) {
+        return make_error("Not logged in");
     }
-    write(client_socket, "Leaving group...", 17);
-
-    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
-        write(client_socket, "Invalid group ID.", 19);
-    }
-    else if(group_members[inpt[1]].find(client_uid) != group_members[inpt[1]].end()){
-        if(group_admins_uid[inpt[1]] == client_uid){
-            write(client_socket, "You are the admin of this group, you cant leave!", 48);
-        }
-        else{
-            group_members[inpt[1]].erase(client_uid);
-            write(client_socket, "Group left succesfully", 23);
-        }
-    }
-    else{
-        write(client_socket, "You are not in this group", 25);
-    }
+    
+    lock_guard<mutex> lock(data_mutex);
+    user_logged_in[username] = false;
+    
+    log_info("User logged out: " + username);
+    return make_success("Logged out successfully");
 }
 
-void list_files(vector<string> inpt, int client_socket){
-    // inpt - list_files​ <group_id>
-    if(inpt.size() != 2){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    write(client_socket, "Fetching files...", 17);
+// ==================== GROUP MANAGEMENT ====================
 
-    char dum[5];
-    read(client_socket, dum, 5);
-    write_log("dum read");
+string handle_create_group(const vector<string>& args, const string& username) {
+    if (args.size() != 2) {
+        return make_error("Usage: create_group <group_id>");
+    }
+    
+    string group_id = args[1];
+     
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) != group_admin.end()) {
+        return make_error("Group already exists");
+    }
+    
+    group_admin[group_id] = username;
+    group_members[group_id].insert(username);
+    
+    log_info("Group created: " + group_id + " by " + username);
+    return make_success("Group created successfully");
+}
 
-    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
-        write(client_socket, "Invalid group ID.", 19);
+string handle_join_group(const vector<string>& args, const string& username) {
+    if (args.size() != 2) {
+        return make_error("Usage: join_group <group_id>");
     }
-    else if(seeder_list[inpt[1]].size() == 0){
-        write(client_socket, "No files found.", 15);
+    
+    string group_id = args[1];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
     }
-    else
+    
+    if (group_members[group_id].count(username)) {
+        return make_error("Already a member of this group");
+    }
+    
+    if (group_pending[group_id].count(username)) {
+        return make_error("Join request already pending");
+    }
+    
+    group_pending[group_id].insert(username);
+    
+    log_info("Join request: " + username + " -> " + group_id);
+    return make_success("Join request sent");
+}
+
+string handle_leave_group(const vector<string>& args, const string& username) {
+    if (args.size() != 2) {
+        return make_error("Usage: leave_group <group_id>");
+    }
+    
+    string group_id = args[1];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (!group_members[group_id].count(username)) {
+        return make_error("Not a member of this group");
+    }
+    
+    if (group_admin[group_id] == username) {
+        return make_error("Admin cannot leave. Transfer admin rights first using change_admin");
+    }
+    
+    group_members[group_id].erase(username);
+    
+    // Remove user from seeder lists in this group
+    for (auto& [filename, seeders] : file_seeders[group_id]) {
+        seeders.erase(username);
+    }
+    
+    log_info("User left group: " + username + " <- " + group_id);
+    return make_success("Left group successfully");
+}
+
+string handle_list_groups(const vector<string>& args) {
+    if (args.size() != 1) {
+        return make_error("Usage: list_groups");
+    }
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.empty()) {
+        return make_success("No groups found");
+    }
+    
+    vector<string> groups;
+    for (const auto& [gid, admin] : group_admin) {
+        groups.push_back(gid);
+    }
+    
+    return make_success(join_string(groups, ","));
+}
+
+string handle_list_requests(const vector<string>& args, const string& username) {
+    if (args.size() != 2) {
+        return make_error("Usage: list_requests <group_id>");
+    }
+    
+    string group_id = args[1];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (group_admin[group_id] != username) {
+        return make_error("Only admin can view pending requests");
+    }
+    
+    if (group_pending[group_id].empty()) {
+        return make_success("No pending requests");
+    }
+    
+    vector<string> requests(group_pending[group_id].begin(), group_pending[group_id].end());
+    return make_success(join_string(requests, ","));
+}
+
+string handle_accept_request(const vector<string>& args, const string& username) {
+    if (args.size() != 3) {
+        return make_error("Usage: accept_request <group_id> <user_id>");
+    }
+    
+    string group_id = args[1];
+    string user_id = args[2];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (group_admin[group_id] != username) {
+        return make_error("Only admin can accept requests");
+    }
+    
+    if (!group_pending[group_id].count(user_id)) {
+        return make_error("No pending request from this user");
+    }
+    
+    group_pending[group_id].erase(user_id);
+    group_members[group_id].insert(user_id);
+    
+    log_info("Request accepted: " + user_id + " -> " + group_id);
+    return make_success("Request accepted");
+}
+
+string handle_change_admin(const vector<string>& args, const string& username) {
+    if (args.size() != 3) {
+        return make_error("Usage: change_admin <group_id> <new_admin_id>");
+    }
+    
+    string group_id = args[1];
+    string new_admin = args[2];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (group_admin[group_id] != username) {
+        return make_error("Only current admin can transfer admin rights");
+    }
+    
+    if (!group_members[group_id].count(new_admin)) {
+        return make_error("New admin must be a member of the group");
+    }
+    
+    group_admin[group_id] = new_admin;
+    
+    log_info("Admin changed: " + group_id + " -> " + new_admin);
+    return make_success("Admin changed successfully");
+}
+
+// ==================== FILE OPERATIONS ====================
+
+string handle_list_files(const vector<string>& args, const string& username) {
+    if (args.size() != 2) {
+        return make_error("Usage: list_files <group_id>");
+    }
+    
+    string group_id = args[1];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (!group_members[group_id].count(username)) {
+        return make_error("Not a member of this group");
+    }
+    
+    if (file_seeders[group_id].empty()) {
+        return make_success("No files shared");
+    }
+    
+    vector<string> files;
+    for (const auto& [filename, seeders] : file_seeders[group_id]) {
+        if (!seeders.empty()) {
+            files.push_back(filename);
+        }
+    }
+    
+    if (files.empty()) {
+        return make_success("No files shared");
+    }
+    
+    return make_success(join_string(files, ","));
+}
+
+string handle_upload_file(const vector<string>& args, const string& username, int client_socket) {
+    if (args.size() != 3) {
+        return make_error("Usage: upload_file <filepath> <group_id>");
+    }
+    
+    string filepath = args[1];
+    string group_id = args[2];
+    
     {
-        write_log("in else of list files");
-
-        string reply = "";
-
-        for(auto i: seeder_list[inpt[1]]){
-            reply += i.first + "$$";
-        }
-        reply = reply.substr(0, reply.length()-2);
-        write_log("list of files reply:" + reply);
-
-        write(client_socket, &reply[0], reply.length());
-    }
-}
-
-void stop_share(vector<string> inpt, int client_socket, string client_uid){
-    // inpt - stop_share ​<group_id> <file_name>
-    if(inpt.size() != 3){
-        write(client_socket, "Invalid argument count", 22);
-        return;
-    }
-    if(group_admins_uid.find(inpt[1]) == group_admins_uid.end()){
-        write(client_socket, "Invalid group ID.", 19);
-    }
-    else if(seeder_list[inpt[1]].find(inpt[2]) == seeder_list[inpt[1]].end()){
-        write(client_socket, "File not yet shared in the group", 32);
-    }
-    else{
-        seeder_list[inpt[1]][inpt[2]].erase(client_uid);
-        if(seeder_list[inpt[1]][inpt[2]].size() == 0){
-            seeder_list[inpt[1]].erase(inpt[2]);
-        }
-        write(client_socket, "Stopped sharing the file", 25);
-    }
-}
-
-// ********************************************************************
-// ********************************************************************
-
-
-void uploadFile(vector<string> inpt, int client_socket, string client_uid){
-    //inpt - upload_file​ <file_path> <group_id​>
-    if(inpt.size() != 3){
-        write(client_socket, "Invalid argument count", 22);
-    }
-    else if(group_members.find(inpt[2]) == group_members.end()){
-        write(client_socket, "Error 101:", 10);
-    }
-    else if(group_members[inpt[2]].find(client_uid) == group_members[inpt[2]].end()){
-        write(client_socket, "Error 102:", 10);
-    }
-    else if(!is_path_exists(inpt[1])){
-        write(client_socket, "Error 103:", 10);
-    }
-    else{
-        char fileDetails[524288] =  {0};
-        write(client_socket, "Uploading...", 12);
-        write_log("uploading");
-
-        if(read(client_socket , fileDetails, 524288)){
-            if(string(fileDetails) == "error") return;
-
-            vector<string> fdet = split_string(string(fileDetails), "$$");
-            //fdet = [filepath, peer address, file size, file hash, piecewise hash] 
-            string filename = split_string(string(fdet[0]), "/").back();
-
-            string hashOfPieces = "";
-            for(size_t i=4; i<fdet.size(); i++){
-                hashOfPieces += fdet[i];
-                if(i != fdet.size()-1) hashOfPieces += "$$";
-            }
-            
-            piece_wise_hash[filename] = hashOfPieces;
-            
-            if(seeder_list[inpt[2]].find(filename) != seeder_list[inpt[2]].end()){
-                seeder_list[inpt[2]][filename].insert(client_uid);
-            }
-            else{
-                seeder_list[inpt[2]].insert({filename, {client_uid}});
-            }
-            file_size[filename] = fdet[2];
-            
-            write(client_socket, "Uploaded", 8);
-        }
-    }
-}
-
-void downloadFile(vector<string> inpt, int client_socket, string client_uid){
-    // inpt - download_file​ <group_id> <file_name> <destination_path>
-    if(inpt.size() != 4){
-        write(client_socket, "Invalid argument count", 22);
-    }
-    else if(group_members.find(inpt[1]) == group_members.end()){
-        write(client_socket, "Error 101:", 10);
-    }
-    else if(group_members[inpt[1]].find(client_uid) == group_members[inpt[1]].end()){
-        write(client_socket, "Error 102:", 10);
-    }
-    else{
-        if(!is_path_exists(inpt[3])){
-            write(client_socket, "Error 103:", 10);
-            return;
-        }
-
-        char fileDetails[524288] =  {0};
-        // fileDetails = [filename, destination, group id]
-        write(client_socket, "Downloading...", 13);
-
-        if(read(client_socket , fileDetails, 524288)){
-            vector<string> fdet = split_string(string(fileDetails), "$$");
-            
-            string reply = "";
-            if(seeder_list[inpt[1]].find(fdet[0]) != seeder_list[inpt[1]].end()){
-                for(auto i: seeder_list[inpt[1]][fdet[0]]){
-                    if(is_logged_in[i]){
-                        reply += uid_to_ip_port[i] + "$$";
-                    }
-                }
-                reply += file_size[fdet[0]];
-                write_log("seeder list: "+ reply);
-                write(client_socket, &reply[0], reply.length());
-
-                char dum[5];
-                read(client_socket, dum, 5);
-                
-                write(client_socket, &piece_wise_hash[fdet[0]][0], piece_wise_hash[fdet[0]].length());
-            
-                seeder_list[inpt[1]][inpt[2]].insert(client_uid);
-            }
-            else{
-                write(client_socket, "File not found", 14);
-            }
+        lock_guard<mutex> lock(data_mutex);
+        
+        if (group_admin.find(group_id) == group_admin.end()) {
+            return make_error("Group does not exist");
         }
         
-    }
-}
-
-
-// ********************************************************************
-// ********************************************************************
-
-
-void clear_log(){
-    ofstream out;
-    out.open(log_file_name);
-    out.clear();
-    out.close();
-}
-
-void write_log(const string &text ){
-    ofstream log_file(log_file_name, ios_base::out | ios_base::app );
-    log_file << text << endl;
-}
-
-bool is_path_exists(const string &s){
-  struct stat buffer;
-  return (stat (s.c_str(), &buffer) == 0);
-}
-
-vector<string> split_string(string str, string delim){
-    vector<string> res;
-
-    size_t pos = 0;
-    while ((pos = str.find(delim)) != string::npos) {
-        string t = str.substr(0, pos);
-        res.push_back(t);
-        str.erase(0, pos + delim.length());
-    }
-    res.push_back(str);
-
-    return res;
-}
-
-/* Thread function which detects if quit was typed in */
-void* check_input(void* arg){
-    while(true){
-        string inputline;
-        getline(cin, inputline);
-        if(inputline == "quit"){
-            exit(0);
+        if (!group_members[group_id].count(username)) {
+            return make_error("Not a member of this group");
         }
     }
+    
+    // Request file details from client
+    send_data(client_socket, make_success("SEND_FILE_DETAILS"));
+    
+    // Receive file details: filename$$filesize$$filehash$$piecehashes
+    string file_details = recv_data(client_socket);
+    if (file_details.empty()) {
+        return make_error("Failed to receive file details");
+    }
+    
+    vector<string> parts = split_string(file_details);
+    if (parts.size() < 4) {
+        return make_error("Invalid file details format");
+    }
+    
+    string filename = parts[0];
+    string filesize = parts[1];
+    string filehash = parts[2];
+    string piecewise_hash = parts[3];
+    
+    {
+        lock_guard<mutex> lock(data_mutex);
+        
+        file_seeders[group_id][filename].insert(username);
+        file_sizes[filename] = filesize;
+        piece_hashes[filename] = piecewise_hash;
+        file_hashes[filename] = filehash;
+    }
+    
+    log_info("File uploaded: " + filename + " by " + username + " to group " + group_id);
+    return make_success("File uploaded successfully");
 }
 
-
-// ********************************************************************
-// ********************************************************************
-
-
-void process_args(int argc, char *argv[]){
-    log_file_name = "trackerlog" + string(argv[2]) + ".txt";
-    clear_log();
-
-    vector<string> trackeraddress = get_trackerfile_Info(argv[1]);
-    if(string(argv[2]) == "1"){
-        tracker1_ip = trackeraddress[0];
-        tracker1_port = stoi(trackeraddress[1]);
-        cur_tracker_ip = tracker1_ip;
-        cur_tracker_port = tracker1_port;
+string handle_download_file(const vector<string>& args, const string& username, int client_socket) {
+    if (args.size() != 4) {
+        return make_error("Usage: download_file <group_id> <filename> <dest_path>");
     }
-    else{
-        tracker2_ip = trackeraddress[2];
-        tracker2_port = stoi(trackeraddress[3]);
-        cur_tracker_ip = tracker2_ip;
-        cur_tracker_port = tracker2_port;
+    
+    string group_id = args[1];
+    string filename = args[2];
+    string dest_path = args[3];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (!group_members[group_id].count(username)) {
+        return make_error("Not a member of this group");
+    }
+    
+    if (file_seeders[group_id].find(filename) == file_seeders[group_id].end()) {
+        return make_error("File not found in group");
+    }
+    
+    // Get list of active seeders
+    vector<string> active_seeders;
+    for (const string& seeder : file_seeders[group_id][filename]) {
+        if (user_logged_in[seeder] && user_address.count(seeder)) {
+            active_seeders.push_back(user_address[seeder]);
+        }
+    }
+    
+    if (active_seeders.empty()) {
+        return make_error("No active seeders available");
     }
 
-    write_log("Tracker 1 Address : " + string(tracker1_ip)+ ":" +to_string(tracker1_port));
-    write_log("Tracker 2 Address : " + string(tracker2_ip)+ ":" +to_string(tracker2_port));
-    write_log("Log file name : " + string(log_file_name) + "\n");
+    // Format: SEEDER_LIST$$seeder1,seeder2,...$$filesize$$piecehashes$$filehash
+    // NOTE: the downloader is NOT added as a seeder here. They must call
+    // register_seeder after confirming the download completed successfully.
+    string seeder_list = join_string(active_seeders, ",");
+    string response = "SEEDER_LIST" + DELIMITER +
+                      seeder_list + DELIMITER +
+                      file_sizes[filename] + DELIMITER +
+                      piece_hashes[filename] + DELIMITER +
+                      file_hashes[filename];
+    
+    log_info("Download initiated: " + filename + " by " + username);
+    return make_success(response);
 }
 
+string handle_register_seeder(const vector<string>& args, const string& username) {
+    if (args.size() != 3) {
+        return make_error("Usage: register_seeder <group_id> <filename>");
+    }
 
-// ********************************************************************
-// ********************************************************************
+    string group_id = args[1];
+    string filename = args[2];
 
+    lock_guard<mutex> lock(data_mutex);
 
-//client connection handling thread
-void handle_connection(int client_socket){
-    string client_uid = "";
-    string client_gid = "";
-    write_log("***********pthread started for client socket number " + to_string(client_socket));
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
 
-    //for continuously checking the commands sent by the client
-    while(true){
-        char inptline[1024] = {0}; 
+    if (!group_members[group_id].count(username)) {
+        return make_error("Not a member of this group");
+    }
 
-        if(read(client_socket , inptline, 1024) <=0){
-            is_logged_in[client_uid] = false;
-            close(client_socket);
+    if (file_seeders[group_id].find(filename) == file_seeders[group_id].end()) {
+        return make_error("File not found in group");
+    }
+
+    file_seeders[group_id][filename].insert(username);
+
+    log_info("Seeder registered: " + username + " for " + filename + " in " + group_id);
+    return make_success("Registered as seeder");
+}
+
+string handle_stop_share(const vector<string>& args, const string& username) {
+    if (args.size() != 3) {
+        return make_error("Usage: stop_share <group_id> <filename>");
+    }
+    
+    string group_id = args[1];
+    string filename = args[2];
+    
+    lock_guard<mutex> lock(data_mutex);
+    
+    if (group_admin.find(group_id) == group_admin.end()) {
+        return make_error("Group does not exist");
+    }
+    
+    if (file_seeders[group_id].find(filename) == file_seeders[group_id].end()) {
+        return make_error("File not found");
+    }
+    
+    file_seeders[group_id][filename].erase(username);
+    
+    // Clean up if no seeders left
+    if (file_seeders[group_id][filename].empty()) {
+        file_seeders[group_id].erase(filename);
+        file_sizes.erase(filename);
+        piece_hashes.erase(filename);
+        file_hashes.erase(filename);
+    }
+    
+    log_info("Stop sharing: " + filename + " by " + username);
+    return make_success("Stopped sharing file");
+}
+
+// ==================== CLIENT HANDLER ====================
+
+void handle_client(int client_socket) {
+    string client_username;
+    
+    log_info("Client connected: socket " + to_string(client_socket));
+    
+    while (true) {
+        // Receive command from client
+        string message = recv_data(client_socket);
+        
+        if (message.empty()) {
+            log_info("Client disconnected: " + (client_username.empty() ? "unknown" : client_username));
             break;
         }
-        write_log("client request:" + string(inptline));
-
-        string s, in = string(inptline);
-        stringstream ss(in);
-        vector<string> inpt;
-
-        while(ss >> s){
-            inpt.push_back(s);
+        
+        // Parse command
+        istringstream iss(message);
+        vector<string> args;
+        string word;
+        while (iss >> word) {
+            args.push_back(word);
         }
-
-        if(inpt[0] == "create_user"){
-            if(inpt.size() != 3){
-                write(client_socket, "Invalid argument count", 22);
-            }
-            else{
-                if(create_user(inpt) < 0){
-                    write(client_socket, "User exists", 11);
+        
+        if (args.empty()) continue;
+        
+        string command = args[0];
+        string response;
+        
+        // Handle commands
+        if (command == "create_user") {
+            response = handle_create_user(args);
+        }
+        else if (command == "login") {
+            response = handle_login(args, client_username, client_socket);
+            
+            // If login successful, receive client address
+            if (response.find("LOGIN_OK") != string::npos) {
+                send_data(client_socket, response);
+                string address = recv_data(client_socket);
+                if (!address.empty()) {
+                    lock_guard<mutex> lock(data_mutex);
+                    user_address[client_username] = address;
+                    log_info("User address registered: " + client_username + " -> " + address);
                 }
-                else{
-                    write(client_socket, "Account created", 15);
-                }
-            }
-        }
-        else if(inpt[0] == "login"){
-            if(inpt.size() != 3){
-                write(client_socket, "Invalid argument count", 22);
-            }
-            else{
-                int r;
-                if((r = login_validation(inpt)) < 0){
-                    write(client_socket, "Username/password incorrect", 28);
-                }
-                else if(r > 0){
-                    write(client_socket, "You already have one active session", 35);
-                }
-                else{
-                    write(client_socket, "Login Successful", 16);
-                    client_uid = inpt[1];
-                    char buf[96];
-                    read(client_socket, buf, 96);
-                    string peerAddress = string(buf);
-                    uid_to_ip_port[client_uid] = peerAddress;
-                }
-            }            
-        }
-        else if(inpt[0] ==  "logout"){
-            is_logged_in[client_uid] = false;
-            write(client_socket, "Logout Successful", 17);
-            write_log("logout sucess\n");
-        }
-        else if(inpt[0] == "upload_file"){
-            uploadFile(inpt, client_socket, client_uid);
-        }
-        else if(inpt[0] == "download_file"){
-            downloadFile(inpt, client_socket, client_uid);
-            write_log("after down");
-        }
-        else if(inpt[0] == "create_group"){
-            if(create_group(inpt, client_socket, client_uid) >=0){
-                client_gid = inpt[1];
-                write(client_socket, "Group created", 13);
-            }
-            else{
-                write(client_socket, "Group exists", 12);
+                response = make_success("Login successful");
             }
         }
-        else if(inpt[0] == "list_groups"){
-            list_groups(inpt, client_socket);
+        else if (command == "logout") {
+            response = handle_logout(client_username);
+            client_username.clear();
         }
-        else if(inpt[0] == "join_group"){
-            join_group(inpt, client_socket, client_uid);
+        else if (client_username.empty()) {
+            response = make_error("Please login first");
         }
-        else if(inpt[0] == "list_requests"){
-            list_requests(inpt, client_socket, client_uid);
+        else if (command == "create_group") {
+            response = handle_create_group(args, client_username);
         }
-        else if(inpt[0] == "accept_request"){
-            accept_request(inpt, client_socket, client_uid);
+        else if (command == "join_group") {
+            response = handle_join_group(args, client_username);
         }
-        else if(inpt[0] == "change_admin"){
-            change_admin(inpt, client_socket, client_uid);
+        else if (command == "leave_group") {
+            response = handle_leave_group(args, client_username);
         }
-        else if(inpt[0] == "leave_group"){
-            leave_group(inpt, client_socket, client_uid);
+        else if (command == "list_groups") {
+            response = handle_list_groups(args);
         }
-        else if(inpt[0] == "list_files"){
-            list_files(inpt, client_socket);
+        else if (command == "list_requests") {
+            response = handle_list_requests(args, client_username);
         }
-        else if(inpt[0] == "stop_share"){
-            stop_share(inpt, client_socket, client_uid);
+        else if (command == "accept_request") {
+            response = handle_accept_request(args, client_username);
         }
-        else if(inpt[0] == "show_downloads"){
-            write(client_socket, "Loading...", 10);
+        else if (command == "change_admin") {
+            response = handle_change_admin(args, client_username);
         }
-        else{
-            write(client_socket, "Invalid command", 16);
+        else if (command == "list_files") {
+            response = handle_list_files(args, client_username);
         }
+        else if (command == "upload_file") {
+            response = handle_upload_file(args, client_username, client_socket);
+        }
+        else if (command == "download_file") {
+            response = handle_download_file(args, client_username, client_socket);
+        }
+        else if (command == "register_seeder") {
+            response = handle_register_seeder(args, client_username);
+        }
+        else if (command == "stop_share") {
+            response = handle_stop_share(args, client_username);
+        }
+        else {
+            response = make_error("Unknown command: " + command);
+        }
+        
+        // Send response
+        send_data(client_socket, response);
     }
-    write_log("***********pthread ended for client socket number " + to_string(client_socket));
+    
+    // Cleanup on disconnect
+    if (!client_username.empty()) {
+        lock_guard<mutex> lock(data_mutex);
+        user_logged_in[client_username] = false;
+    }
+    
     close(client_socket);
 }
 
+// ==================== MAIN ====================
 
-// ********************************************************************
-// ********************************************************************
-
-
-
-int main(int argc, char *argv[]){ 
-
-    if(argc != 3){
-        cout << "Give arguments as <tracker info file name> and <tracker_number>\n";
-        return -1;
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        cerr << "Usage: " << argv[0] << " <tracker_ip> <tracker_port>" << endl;
+        cerr << "Example: " << argv[0] << " 192.168.1.100 5000" << endl;
+        return 1;
     }
-
-    process_args(argc, argv);
-
-    int tracker_socket; 
-    struct sockaddr_in address; 
-    int opt = 1; 
-    int addrlen = sizeof(address); 
-    pthread_t  exitDetectionThreadId;
-       
-    if ((tracker_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) { 
-        perror("socket failed"); 
-        exit(EXIT_FAILURE); 
-    } 
-    write_log("Tracker socket created.");
-       
-    if (setsockopt(tracker_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) { 
-        perror("setsockopt"); 
-        exit(EXIT_FAILURE); 
-    } 
-    address.sin_family = AF_INET; 
-    address.sin_port = htons(cur_tracker_port); 
-
-    if(inet_pton(AF_INET, &cur_tracker_ip[0], &address.sin_addr)<=0)  { 
-        printf("\nInvalid address/ Address not supported \n"); 
-        return -1; 
-    } 
-       
-    if (bind(tracker_socket, (SA *)&address,  sizeof(address))<0) { 
-        perror("bind failed"); 
-        exit(EXIT_FAILURE); 
-    } 
-    write_log("Binding completed.");
-
-    if (listen(tracker_socket, 3) < 0) { 
-        perror("listen"); 
-        exit(EXIT_FAILURE); 
-    } 
-    write_log("Listening...");
-
-    vector<thread> threadVector;
-
-    if(pthread_create(&exitDetectionThreadId, NULL, check_input, NULL) == -1){
-        perror("pthread"); 
-        exit(EXIT_FAILURE); 
+    
+    string tracker_ip = argv[1];
+    int tracker_port = stoi(argv[2]);
+    
+    log_info("Starting Tracker Server...");
+    log_info("IP: " + tracker_ip + ", Port: " + to_string(tracker_port));
+    
+    // Create server socket
+    int server_socket = create_socket();
+    if (server_socket < 0) {
+        return 1;
     }
-
-    while(true){
-        int client_socket;
-
-        if((client_socket = accept(tracker_socket, (SA *)&address, (socklen_t *)&addrlen)) < 0){
-            perror("Acceptance error");
-            write_log("Error in accept"); 
+    
+    // Bind and listen
+    if (bind_and_listen(server_socket, tracker_ip, tracker_port) < 0) {
+        close(server_socket);
+        return 1;
+    }
+    
+    log_info("Tracker is listening for connections...");
+    log_info("Type 'quit' to stop the server");
+    
+    // Start quit detection thread
+    thread quit_thread([]() {
+        string input;
+        while (getline(cin, input)) {
+            if (input == "quit") {
+                log_info("Shutting down tracker...");
+                exit(0);
+            }
         }
-        write_log("Connection Accepted");
-
-        threadVector.push_back(thread(handle_connection, client_socket));
+    });
+    quit_thread.detach();
+    
+    // Accept connections
+    while (true) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        
+        int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_socket < 0) {
+            perror("Accept failed");
+            continue;
+        }
+        
+        // Handle client in new thread
+        thread client_thread(handle_client, client_socket);
+        client_thread.detach();
     }
-    for(auto i=threadVector.begin(); i!=threadVector.end(); i++){
-        if(i->joinable()) i->join();
-    }
-
-    write_log("EXITING.");
-    return 0; 
-} 
+    
+    close(server_socket);
+    return 0;
+}

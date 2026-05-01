@@ -1,1017 +1,863 @@
-#include <bits/stdc++.h>
-#include <openssl/sha.h>
-#include <arpa/inet.h> 
-#include <sys/socket.h> 
-#include <unistd.h>
-#include <pthread.h>
-#include <fcntl.h>
-using namespace std;
+/**
+ * Client/Peer for P2P File Sharing System
+ * 
+ * This client acts as both:
+ * - Client: Connects to tracker and other peers to download files
+ * - Server: Serves file chunks to other peers
+ * 
+ * Usage: ./client <client_ip> <client_port> <tracker_ip> <tracker_port>
+ * Example: ./client 192.168.1.101 6000 192.168.1.100 5000
+ */
 
-#define SA struct sockaddr 
-#define ll long long int
+#include "common.h"
+#include <atomic>
+#include <queue>
+#include <future>
+#include <random>
 
-string peer_ip; 
-uint16_t peer_port;
-bool is_loggedin; //true if logged in, false otherwise
-unordered_map<string, unordered_map<string, bool>> is_uploaded; // group -> filename -> bool
-unordered_map<string, vector<int>> file_to_chunk_bitvector; // filename -> bitvector of chunks
-vector<vector<string>> curdown_ch_ind_to_seederlist; // currently downloading file chunk's index -> vector of peer's ip:port who has that chunk.
-unordered_map<string, string> file_name_to_filePath; // filename -> filepath
-vector<string> cur_file_PiecewiseHash; // currently downloading file's piecewise hash
-string tracker1_ip;
-string tracker2_ip;
-uint16_t tracker1_port, tracker2_port;
+// ==================== GLOBAL STATE ====================
 
-unordered_map<string, string> downloaded_files; // filename -> groupid
-bool is_corrupted_file;
-string log_file_name;
+// Client network info
+string my_ip;
+int my_port;
+string tracker_ip;
+int tracker_port;
 
+// Login state
+atomic<bool> is_logged_in(false);
+string current_user;
 
-typedef struct peerFileDetails{
-    string serverPeerIP;
-    string filename;
-    ll filesize;
-} peerFileDetails;
- 
-typedef struct reqdChunkDetails{
-    string serverPeerIP;
-    string filename;
-    ll chunkNum; 
-    string destination;
-} reqdChunkDetails;
+// File state
+// filename -> filepath (for files we're sharing)
+map<string, string> shared_files;
 
+// filename -> bitvector (which chunks we have)
+map<string, vector<bool>> file_chunks;
 
+// filename -> piece hashes (for verification)
+map<string, vector<string>> file_hashes;
 
-#define SEGMENT_SIZE 524288
-#define SIZE 32768
+// Downloaded files: filename -> group_id
+map<string, string> downloaded_files;
 
-int list_groups(int);
-int list_requests(int);
-void accept_request(int);
-void leave_group(int);
-void show_downloads();
-void list_files(int);
+// Mutex for thread-safe operations
+mutex file_mutex;
 
-void cal_string_hash(string, string&);
-string cal_hash(char*);
-string cal_file_hash(char*);
+// Server running flag
+atomic<bool> server_running(true);
 
-long long file_size(char*);
-void write_log(const string &);
-void clear_log();
-vector<string> split_string(string, string);
-void update_file_chunk_bitvector(string, ll, ll, bool);
+// ==================== PEER SERVER ====================
 
-void configure_trackerinfo(int, char **);
-int connect_to_tracker(int, struct sockaddr_in &, int);
-int process_tracker_command(vector<string>, int);
-
-void handle_peer_request(int);
-string connect_to_peer(char*, char*, string);
-void* run_as_server(void*);
-
-void send_chunk(char*, int, int);
-int write_chunk(int, ll cnkNum, char*);
-void get_bit_vector(peerFileDetails* pf);
-void getChunk(reqdChunkDetails* reqdChunk);
-void piece_selection_algorithm(vector<string>, vector<string>);
-int downloadFile(vector<string>, int);
-int uploadFile(vector<string>, int);
-
-
-// ***************** Group Related Functions **************************
-
- 
-int list_groups(int sock){
-    char dum[5];
-    strcpy(dum, "test");
-    write(sock, dum, 5);
-
-    char reply[3*SIZE];
-    memset(reply, 0, sizeof(reply));
-    read(sock, reply, 3*SIZE);
-    write_log("list of groups reply: " + string(reply));
-
-    vector<string> grps = split_string(string(reply), "$$");
-
-    for(size_t i=0; i<grps.size()-1; i++){
-        cout << grps[i] << endl;
-    }
-    return 0;
-}
-
-int list_requests(int sock){
-    write_log("waiting for response");
-
-    char dum[5];
-    strcpy(dum, "test");
-    write(sock, dum, 5);
+/**
+ * Handle request from another peer
+ */
+void handle_peer_request(int peer_socket) {
+    string request = recv_data(peer_socket);
     
-    char reply[3*SIZE];
-    memset(reply, 0, 3*SIZE);
-    read(sock, reply, 3*SIZE);
-    if(string(reply) == "**err**") return -1;
-    if(string(reply) == "**er2**") return 1;
-    write_log("request list: " + string(reply));
-
-    vector<string> requests = split_string(string(reply), "$$");
-    write_log("list request response size: "+ to_string(requests.size()));
-    for(size_t i=0; i<requests.size()-1; i++){
-        cout << requests[i] << endl;
-    }
-    return 0;
-}
-
-void accept_request(int sock){
-    char dum[5];
-    strcpy(dum, "test");
-    write(sock, dum, 5);
-
-    char buf[96];
-    read(sock, buf, 96);
-    cout << buf << endl;
-}
-
-void change_admin(int sock){
-    char dum[5];
-    strcpy(dum, "test");
-    write(sock, dum, 5);
-
-    char buf[96];
-    read(sock, buf, 96);
-    cout << buf << endl;
-}
-
-void leave_group(int sock){
-    write_log("waiting for response");
-    char buf[96];
-    read(sock, buf, 96);
-    cout << buf << endl;
-}
-
-void list_files(int sock){
-    char dum[5];
-    strcpy(dum, "test");
-    write(sock, dum, 5);
-
-    char buf[1024];
-    bzero(buf, 1024);
-    read(sock, buf, 1024);
-    vector<string> listOfFiles = split_string(string(buf), "$$");
-
-    for(auto i: listOfFiles)
-        cout << i << endl;
-}
-
-void show_downloads(){
-    for(auto i: downloaded_files){
-        cout << "[C] " << i.second << " " << i.first << endl;
-    }
-}
-
-
-
-//  *************** Hash Related Functions **************************
-
-void cal_string_hash(string segmentString, string& hash){
-    unsigned char md[20];
-    if(!SHA1(reinterpret_cast<const unsigned char *>(&segmentString[0]), segmentString.length(), md)){
-        printf("Error in hashing\n");
-    }
-    else{
-        for(int i=0; i<20; i++){
-            char buf[3];
-            sprintf(buf, "%02x", md[i]&0xff);
-            hash += string(buf);
-        }
-    }
-    hash += "$$";
-}
-
-string cal_hash(char* path){
-    
-    int  i, accum;
-    FILE *fp1;
-
-    long long fileSize = file_size(path);
-    if(fileSize == -1){
-        return "$";
-    }
-    int segments = fileSize/SEGMENT_SIZE + 1;
-    char line[SIZE + 1];
-    string hash = "";
-
-    fp1 = fopen(path, "r");
-
-    if(fp1){ 
-        for(i=0;i<segments;i++){
-            accum = 0;
-            string segmentString;
-
-            int rc;
-            while(accum < SEGMENT_SIZE && (rc = fread(line, 1, min(SIZE-1, SEGMENT_SIZE-accum), fp1))){
-                line[rc] = '\0';
-                accum += strlen(line);
-                segmentString += line;
-                memset(line, 0, sizeof(line));
-            }
-
-            cal_string_hash(segmentString, hash);
-
-        }
-        
-        fclose(fp1);
-    }
-    else{
-        printf("File not found.\n");
-    }
-    hash.pop_back();
-    hash.pop_back();
-    return hash;
-}
-
-string cal_file_hash(char* path){
-
-    ostringstream buf; 
-    ifstream input (path); 
-    buf << input.rdbuf(); 
-    string contents =  buf.str(), hash;
-
-    unsigned char md[SHA256_DIGEST_LENGTH];
-    if(!SHA256(reinterpret_cast<const unsigned char *>(&contents[0]), contents.length(), md)){
-        printf("Error in hashing\n");
-    }
-    else{
-        for(int i=0; i<SHA256_DIGEST_LENGTH; i++){
-            char buf[3];
-            sprintf(buf, "%02x", md[i]&0xff);
-            hash += string(buf);
-        }
-    }
-    return hash;
-}
-
-
-// ******************** Utilility Functions *************
-
-
-void write_log(const string &text ){
-    ofstream log_file(log_file_name, ios_base::out | ios_base::app );
-    log_file << text << endl;
-}
-
-void clear_log(){
-    ofstream out;
-    out.open(log_file_name);
-    out.clear();
-    out.close();
-}
- 
-vector<string> split_string(string address, string delim = ":"){
-    vector<string> res;
-
-    size_t pos = 0;
-    while ((pos = address.find(delim)) != string::npos) {
-        string t = address.substr(0, pos);
-        res.push_back(t);
-        address.erase(0, pos + delim.length());
-    }
-    res.push_back(address);
-
-    return res;
-}
-
-void update_file_chunk_bitvector(string filename, ll l, ll r, bool isUpload){
-    if(isUpload){
-        vector<int> tmp(r-l+1, 1);
-        file_to_chunk_bitvector[filename] = tmp;
-    }
-    else{
-        file_to_chunk_bitvector[filename][l] = 1;
-        write_log("chunk vector updated for " + filename + " at " + to_string(l));
-    }
-}
-
-long long file_size(char *path){
-    FILE *fp = fopen(path, "rb"); 
-
-    long size=-1;
-    if(fp){
-        fseek (fp, 0, SEEK_END);
-        size = ftell(fp)+1;
-        fclose(fp);
-    }
-    else{
-        printf("File not found.\n");
-        return -1;
-    }
-    return size;
-}
-
-
-
-// ******************** Tracker Related Functions *************
-
-void configure_trackerinfo(int argc, char *argv[]){
-    string peerInfo = argv[1];
-    string trackerInfoFilename = argv[2];
-
-    log_file_name = peerInfo + "_log.txt";
-    clear_log();
-
-    vector<string> peeraddress = split_string(peerInfo);
-    peer_ip = peeraddress[0];
-    peer_port = stoi(peeraddress[1]);
-
-    char curDir[128];
-    getcwd(curDir, 128);
-    
-    string path = string(curDir);
-    path += "/" + trackerInfoFilename;
-    vector<string> trackerInfo;
-    
-    fstream trackerInfoFile;
-    trackerInfoFile.open(&path[0], ios::in);
-
-    if(trackerInfoFile.is_open()){
-        string t;
-        while(getline(trackerInfoFile, t)){
-            trackerInfo.push_back(t);
-        }
-        trackerInfoFile.close();
-    }
-    else{
-        cout << "Tracker Info file not found.\n";
-        exit(-1);
-    }
-    
-
-    tracker1_ip = trackerInfo[0];
-    tracker1_port = stoi(trackerInfo[1]);
-    tracker2_ip = trackerInfo[2];
-    tracker2_port = stoi(trackerInfo[3]);
-
-    write_log("Peer Address : " + string(peer_ip)+ ":" +to_string(peer_port));
-    write_log("Tracker 1 Address : " + string(tracker1_ip)+ ":" +to_string(tracker1_port));
-    write_log("Tracker 2 Address : " + string(tracker2_ip)+ ":" +to_string(tracker2_port));
-    write_log("Log file name : " + string(log_file_name) + "\n");
-}
-
-int connect_to_tracker(int trackerNum, struct sockaddr_in &serv_addr, int sock){
-    char* curTrackIP;
-    uint16_t curTrackPort;
-    if(trackerNum == 1){
-        curTrackIP = &tracker1_ip[0]; 
-        curTrackPort = tracker1_port;
-    }
-    else{
-        curTrackIP = &tracker2_ip[0]; 
-        curTrackPort = tracker2_port;
-    }
-
-    bool err = 0;
-
-    serv_addr.sin_family = AF_INET; 
-    serv_addr.sin_port = htons(curTrackPort); 
-       
-    if(inet_pton(AF_INET, curTrackIP, &serv_addr.sin_addr)<=0)  { 
-        err = 1;
-    } 
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) { 
-        err = 1;
-    } 
-    if(err){
-        if(trackerNum == 1)
-            return connect_to_tracker(2, serv_addr, sock);
-        else
-            return -1;
-    }
-    write_log("connected to server " + to_string(curTrackPort));
-    return 0;
-}
- 
-int process_tracker_command(vector<string> inpt, int sock){
-    char server_reply[10240]; 
-    bzero(server_reply, 10240);
-    read(sock , server_reply, 10240); 
-    cout << server_reply << endl;
-    write_log("primary server response: " + string(server_reply));
- 
-    if(string(server_reply) == "Invalid argument count") return 0;
-    if(inpt[0] == "login"){
-        if(string(server_reply) == "Login Successful"){
-            is_loggedin = true;
-            string peerAddress = peer_ip + ":" + to_string(peer_port);
-            write(sock, &peerAddress[0], peerAddress.length());
-        }
-    }
-    else if(inpt[0] == "logout"){
-        is_loggedin = false;
-    }
-    else if(inpt[0] == "upload_file"){
-        if(string(server_reply) == "Error 101:"){
-            cout << "Group doesn't exist" << endl;
-            return 0;
-        }
-        else  if(string(server_reply) == "Error 102:"){
-            cout << "You are not a member of this group" << endl;
-            return 0;
-        }
-        else  if(string(server_reply) == "Error 103:"){
-            cout << "File not found." << endl;
-            return 0;
-        }
-        return uploadFile(inpt, sock);
-    }
-    else if(inpt[0] == "download_file"){
-        if(string(server_reply) == "Error 101:"){
-            cout << "Group doesn't exist" << endl;
-            return 0;
-        }
-        else  if(string(server_reply) == "Error 102:"){
-            cout << "You are not a member of this group" << endl;
-            return 0;
-        }
-        else  if(string(server_reply) == "Error 103:"){
-            cout << "Directory not found" << endl;
-            return 0;
-        }
-        if(downloaded_files.find(inpt[2])!= downloaded_files.end()){
-            cout << "File already downloaded" << endl;
-            return 0;
-        }
-        return downloadFile(inpt, sock);
-    }
-    else if(inpt[0] == "list_groups"){
-        return list_groups(sock);
-    }
-    else if(inpt[0] == "list_requests"){
-        int t;
-        if((t = list_requests(sock)) < 0){
-            cout << "You are not the admin of this group\n";
-        }
-        else if(t>0){
-            cout << "No pending requests\n";
-        }
-        else return 0;
-    }
-    else if(inpt[0] == "accept_request"){
-        accept_request(sock);
-    }
-    else if(inpt[0] == "change_admin"){
-        change_admin(sock);
-    }
-    else if(inpt[0] == "leave_group"){
-        leave_group(sock);
-    }
-    else if(inpt[0] == "list_files"){
-        list_files(sock);
-    }
-    else if(inpt[0] == "stop_share"){
-        is_uploaded[inpt[1]].erase(inpt[2]);
-    }
-    else if(inpt[0] == "show_downloads"){
-        show_downloads();
-    }
-    return 0;
-}
-
-
-// ******************* Peer To Peer **************************
-
-/* Handles different requests from peer client */
-void handle_peer_request(int client_socket){
-    string client_uid = "";
-
-    write_log("\nclient socket num: " + to_string(client_socket) + "\n");
-    char inptline[1024] = {0}; 
-
-    if(read(client_socket , inptline, 1024) <=0){
-        close(client_socket);
+    if (request.empty()) {
+        close(peer_socket);
         return;
     }
     
-    write_log("client request at server " + string(inptline));
-    vector<string> inpt = split_string(string(inptline), "$$");
-    write_log(inpt[0]);
-
-    if(inpt[0] == "get_chunk_vector"){
-        write_log("\nsending chunk vector..");
-        string filename = inpt[1];
-        vector<int> chnkvec = file_to_chunk_bitvector[filename];
-        string tmp = "";
-        for(int i: chnkvec) tmp += to_string(i);
-        char* reply = &tmp[0];
-        write(client_socket, reply, strlen(reply));
-        write_log("sent: " + string(reply));
+    vector<string> parts = split_string(request);
+    
+    if (parts.empty()) {
+        close(peer_socket);
+        return;
     }
-    else if(inpt[0] == "get_chunk"){
-        //inpt = [get_chunk, filename, to_string(chunkNum), destination]
-        write_log("\nsending chunk...");
-        string filepath = file_name_to_filePath[inpt[1]];
-        ll chunkNum = stoll(inpt[2]);
-        write_log("filepath: "+ filepath);
-
-        write_log("sending " + to_string(chunkNum) + " from " + string(peer_ip) + ":" + to_string(peer_port));
-
-        send_chunk(&filepath[0], chunkNum, client_socket);
+    
+    string command = parts[0];
+    
+    if (command == "GET_BITVECTOR" && parts.size() >= 2) {
+        // Return which chunks we have for a file
+        string filename = parts[1];
         
+        lock_guard<mutex> lock(file_mutex);
+        
+        if (file_chunks.find(filename) == file_chunks.end()) {
+            send_data(peer_socket, "ERROR$$File not found");
+        } else {
+            string bitvector;
+            for (bool has_chunk : file_chunks[filename]) {
+                bitvector += (has_chunk ? "1" : "0");
+            }
+            send_data(peer_socket, "OK$$" + bitvector);
+        }
     }
-    else if(inpt[0] == "get_file_path"){
-        string filepath = file_name_to_filePath[inpt[1]];
-        write_log("command from peer client: " +  string(inptline));
-        write(client_socket, &filepath[0], strlen(filepath.c_str()));
+    else if (command == "GET_CHUNK" && parts.size() >= 3) {
+        // Send a specific chunk
+        string filename = parts[1];
+        int chunk_num = stoi(parts[2]);
+        
+        string filepath;
+        {
+            lock_guard<mutex> lock(file_mutex);
+            if (shared_files.find(filename) == shared_files.end()) {
+                send_data(peer_socket, "ERROR$$File not found");
+                close(peer_socket);
+                return;
+            }
+            filepath = shared_files[filename];
+        }
+        
+        // Read the chunk from file
+        ifstream file(filepath, ios::binary);
+        if (!file.is_open()) {
+            send_data(peer_socket, "ERROR$$Cannot open file");
+            close(peer_socket);
+            return;
+        }
+        
+        file.seekg((long long)chunk_num * CHUNK_SIZE);
+        vector<char> buffer(CHUNK_SIZE);
+        file.read(buffer.data(), CHUNK_SIZE);
+        size_t bytes_read = file.gcount();
+        file.close();
+        
+        // Send chunk data
+        string chunk_data(buffer.data(), bytes_read);
+        
+        // First send size, then data
+        send_data(peer_socket, "OK$$" + to_string(bytes_read));
+        
+        // Wait for acknowledgment
+        string ack = recv_data(peer_socket);
+        if (ack != "READY") {
+            close(peer_socket);
+            return;
+        }
+        
+        // Send raw chunk data
+        ssize_t sent = 0;
+        while (sent < (ssize_t)bytes_read) {
+            ssize_t n = send(peer_socket, buffer.data() + sent, bytes_read - sent, MSG_NOSIGNAL);
+            if (n <= 0) break;
+            sent += n;
+        }
+        
+        log_debug("Sent chunk " + to_string(chunk_num) + " of " + filename);
     }
-    close(client_socket);
-    return;
+    else {
+        send_data(peer_socket, "ERROR$$Unknown command");
+    }
+    
+    close(peer_socket);
 }
 
-/*Connects to <serverPeerIP:serverPortIP> and sends it <command>*/
-string connect_to_peer(char* serverPeerIP, char* serverPortIP, string command){
-    int peersock = 0;
-    struct sockaddr_in peer_serv_addr; 
-
-    write_log("\nInside connect_to_peer");
-
-    if ((peersock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {  
-        printf("\n Socket creation error \n"); 
-        return "error"; 
-    } 
-    write_log("Socket Created");
-
-    peer_serv_addr.sin_family = AF_INET; 
-    uint16_t peerPort = stoi(string(serverPortIP));
-    peer_serv_addr.sin_port = htons(peerPort); 
-    write_log("\n needs to connect to " + string(serverPeerIP) + ":" + to_string(peerPort));
-
-    if(inet_pton(AF_INET, serverPeerIP, &peer_serv_addr.sin_addr) < 0){ 
-        perror("Peer Connection Error(INET)");
-    } 
-    if (connect(peersock, (struct sockaddr *)&peer_serv_addr, sizeof(peer_serv_addr)) < 0) { 
-        perror("Peer Connection Error");
-    } 
-    write_log("Connected to peer " + string(serverPeerIP) + ":" + to_string(peerPort));
- 
-    string curcmd = split_string(command, "$$").front();
-    write_log("current command " + curcmd);
-
-    if(curcmd == "get_chunk_vector"){
-        if(send(peersock , &command[0] , strlen(&command[0]) , MSG_NOSIGNAL ) == -1){
-            printf("Error: %s\n",strerror(errno));
-            return "error"; 
-        }
-        write_log("sent command to peer: " + command);
-        char server_reply[10240] = {0};
-        if(read(peersock, server_reply, 10240) < 0){
-            perror("err: ");
-            return "error";
-        }
-        write_log("got reply: " + string(server_reply));
-        close(peersock);
-        return string(server_reply);
+/**
+ * Run peer server in background thread
+ */
+void run_peer_server() {
+    int server_socket = create_socket();
+    if (server_socket < 0) {
+        log_error("Failed to create peer server socket");
+        return;
     }
-    else if(curcmd == "get_chunk"){
-        //"get_chunk $$ filename $$ to_string(chunkNum) $$ destination
-        if(send(peersock , &command[0] , strlen(&command[0]) , MSG_NOSIGNAL ) == -1){
-            printf("Error: %s\n",strerror(errno));
-            return "error"; 
-        }
-        write_log("sent command to peer: " + command);
-        vector<string> cmdtokens = split_string(command, "$$");
+    
+    if (bind_and_listen(server_socket, my_ip, my_port) < 0) {
+        close(server_socket);
+        log_error("Failed to bind peer server");
+        return;
+    }
+    
+    log_info("Peer server running on " + my_ip + ":" + to_string(my_port));
+    
+    while (server_running) {
+        struct sockaddr_in peer_addr;
+        socklen_t addr_len = sizeof(peer_addr);
         
-        string despath = cmdtokens[3];
-        ll chunkNum = stoll(cmdtokens[2]);
-        write_log("\ngetting chunk " + to_string(chunkNum) + " from "+ string(serverPortIP));
-
-        write_chunk(peersock, chunkNum, &despath[0]);
-
-        return "ss";
-    }
-    else if(curcmd == "get_file_path"){
-        if(send(peersock , &command[0] , strlen(&command[0]) , MSG_NOSIGNAL ) == -1){
-            printf("Error: %s\n",strerror(errno));
-            return "error"; 
+        int peer_socket = accept(server_socket, (struct sockaddr*)&peer_addr, &addr_len);
+        if (peer_socket < 0) {
+            if (server_running) perror("Accept failed");
+            continue;
         }
-        char server_reply[10240] = {0};
-        if(read(peersock, server_reply, 10240) < 0){
-            perror("err: ");
-            return "error";
-        }
-        write_log("server reply for get file path:" + string(server_reply));
-        file_name_to_filePath[split_string(command, "$$").back()] = string(server_reply);
+        
+        // Handle peer request in new thread
+        thread peer_thread(handle_peer_request, peer_socket);
+        peer_thread.detach();
     }
-
-    close(peersock);
-    write_log("terminating connection with " + string(serverPeerIP) + ":" + to_string(peerPort));
-    return "aa";
-}
-
-/* The peer acts as a server, continuously listening for connection requests */
-void* run_as_server(void* arg){
-    int server_socket; 
-    struct sockaddr_in address; 
-    int addrlen = sizeof(address); 
-    int opt = 1; 
-
-    write_log("\n" + to_string(peer_port) + " will start running as server");
-    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) { 
-        perror("socket failed"); 
-        exit(EXIT_FAILURE); 
-    } 
-    write_log(" Server socket created.");
-
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) { 
-        perror("setsockopt"); 
-        exit(EXIT_FAILURE); 
-    } 
-    address.sin_family = AF_INET; 
-    address.sin_port = htons(peer_port); 
-
-    if(inet_pton(AF_INET, &peer_ip[0], &address.sin_addr)<=0)  { 
-        printf("\nInvalid address/ Address not supported \n"); 
-        return NULL; 
-    } 
-       
-    if (bind(server_socket, (SA *)&address,  sizeof(address))<0) { 
-        perror("bind failed"); 
-        exit(EXIT_FAILURE); 
-    } 
-    write_log(" Binding completed.");
-
-    if (listen(server_socket, 3) < 0) { 
-        perror("listen"); 
-        exit(EXIT_FAILURE); 
-    } 
-    write_log("Listening...\n");
-
-    vector<thread> vThread;
-    while(true){
-
-        int client_socket;
-
-        if((client_socket = accept(server_socket, (SA *)&address, (socklen_t *)&addrlen)) < 0){
-            perror("Acceptance error");
-            write_log("Error in accept"); 
-        }
-        write_log(" Connection Accepted");
-
-        vThread.push_back(thread(handle_peer_request, client_socket));
-    }
-    for(auto it=vThread.begin(); it!=vThread.end();it++){
-        if(it->joinable()) it->join();
-    }
+    
     close(server_socket);
 }
 
+// ==================== PEER-TO-PEER DOWNLOAD ====================
 
-
-
-//************************ Upload and Download Functions *******************************//
-
-
-
-void send_chunk(char* filepath, int chunkNum, int client_socket){
-
-    std::ifstream fp1(filepath, std::ios::in|std::ios::binary);
-    fp1.seekg(chunkNum*SEGMENT_SIZE, fp1.beg);
-
-    write_log("sending data starting at " + to_string(fp1.tellg()));
-    char buffer[SEGMENT_SIZE] = {0}; 
-    int rc = 0;
-    string sent = "";
-
-    fp1.read(buffer, sizeof(buffer));
-    int count = fp1.gcount();
-
-    if ((rc = send(client_socket, buffer, count, 0)) == -1) {
-        perror("[-]Error in sending file.");
-        exit(1);
+/**
+ * Get bitvector from a peer
+ * Returns: bitvector string or empty on failure
+ */
+string get_peer_bitvector(const string& peer_addr, const string& filename) {
+    vector<string> addr_parts = split_string(peer_addr, ":");
+    if (addr_parts.size() != 2) return "";
+    
+    int sock = create_socket();
+    if (sock < 0) return "";
+    
+    if (connect_to_server(sock, addr_parts[0], stoi(addr_parts[1])) < 0) {
+        close(sock);
+        return "";
     }
     
-    write_log("sent till "+to_string(fp1.tellg()));
-
-    fp1.close();
-} 
-
-int write_chunk(int peersock, ll chunkNum, char* filepath){  
+    send_data(sock, "GET_BITVECTOR$$" + filename);
+    string response = recv_data(sock);
+    close(sock);
     
-    int n, tot = 0;
-    char buffer[SEGMENT_SIZE];
-
-    string content = "";
-    while (tot < SEGMENT_SIZE) {
-        n = read(peersock, buffer, SEGMENT_SIZE-1);
-        if (n <= 0){
-            break;
-        }
-        buffer[n] = 0;
-        fstream outfile(filepath, std::fstream::in | std::fstream::out | std::fstream::binary);
-        outfile.seekp(chunkNum*SEGMENT_SIZE+tot, ios::beg);
-        outfile.write(buffer, n);
-        outfile.close();
-
-        write_log("written at: "+ to_string(chunkNum*SEGMENT_SIZE + tot));
-        write_log("written till: " + to_string(chunkNum*SEGMENT_SIZE + tot + n-1) +"\n");
-
-        content += buffer;
-        tot += n;
-        bzero(buffer, SEGMENT_SIZE);
+    vector<string> parts = split_string(response);
+    if (parts.size() >= 2 && parts[0] == "OK") {
+        return parts[1];
     }
     
-    string hash = "";
-    cal_string_hash(content, hash);
-    hash.pop_back();
-    hash.pop_back();
-    if(hash != cur_file_PiecewiseHash[chunkNum]){
-        is_corrupted_file = true;
-    } 
-    
-    string filename = split_string(string(filepath), "/").back();
-    update_file_chunk_bitvector(filename, chunkNum, chunkNum, false);
-
-    return 0;
+    return "";
 }
 
-void get_bit_vector(peerFileDetails* pf){
-
-    write_log("Getting chunk info of : "+ pf->filename + " from "+ pf->serverPeerIP);
+/**
+ * Download a chunk from a peer
+ * Returns: true on success
+ */
+bool download_chunk(const string& peer_addr, const string& filename, 
+                    int chunk_num, const string& dest_path, const string& expected_hash) {
+    vector<string> addr_parts = split_string(peer_addr, ":");
+    if (addr_parts.size() != 2) return false;
     
-    vector<string> serverPeerAddress = split_string(string(pf->serverPeerIP), ":");
-    string command = "get_chunk_vector$$" + string(pf->filename);
-    string response = connect_to_peer(&serverPeerAddress[0][0], &serverPeerAddress[1][0], command);
-
-    for(size_t i=0; i<curdown_ch_ind_to_seederlist.size(); i++){
-        if(response[i] == '1'){
-            curdown_ch_ind_to_seederlist[i].push_back(string(pf->serverPeerIP));
-        }
+    int sock = create_socket();
+    if (sock < 0) return false;
+    
+    if (connect_to_server(sock, addr_parts[0], stoi(addr_parts[1])) < 0) {
+        close(sock);
+        return false;
     }
-
-    delete pf;
+    
+    // Request chunk
+    send_data(sock, "GET_CHUNK$$" + filename + "$$" + to_string(chunk_num));
+    
+    // Get response with chunk size
+    string response = recv_data(sock);
+    vector<string> parts = split_string(response);
+    
+    if (parts.size() < 2 || parts[0] != "OK") {
+        close(sock);
+        return false;
+    }
+    
+    size_t chunk_size = stoul(parts[1]);
+    
+    // Send ready acknowledgment
+    send_data(sock, "READY");
+    
+    // Receive chunk data
+    vector<char> buffer(chunk_size);
+    size_t received = 0;
+    
+    while (received < chunk_size) {
+        ssize_t n = recv(sock, buffer.data() + received, chunk_size - received, 0);
+        if (n <= 0) {
+            close(sock);
+            return false;
+        }
+        received += n;
+    }
+    
+    close(sock);
+    
+    // Verify hash
+    string chunk_data(buffer.data(), chunk_size);
+    string actual_hash = sha1_hash(chunk_data);
+    
+    if (actual_hash != expected_hash) {
+        log_error("Hash mismatch for chunk " + to_string(chunk_num));
+        return false;
+    }
+    
+    // Write to destination file
+    fstream file(dest_path, ios::in | ios::out | ios::binary);
+    if (!file.is_open()) {
+        log_error("Cannot open destination file");
+        return false;
+    }
+    
+    file.seekp((long long)chunk_num * CHUNK_SIZE);
+    file.write(buffer.data(), chunk_size);
+    file.close();
+    
+    return true;
 }
 
-void getChunk(reqdChunkDetails* reqdChunk){
+// ==================== PARALLEL DOWNLOAD INFRASTRUCTURE ====================
 
-    write_log("Chunk fetching details :" + reqdChunk->filename + " " + 
-            reqdChunk->serverPeerIP + " " + to_string(reqdChunk->chunkNum));
+const int MAX_PARALLEL_DOWNLOADS = 4;
 
-    string filename = reqdChunk->filename;
-    vector<string> serverPeerIP = split_string(reqdChunk->serverPeerIP, ":");
-    ll chunkNum = reqdChunk->chunkNum;
-    string destination = reqdChunk->destination;
+// State shared across all download worker threads.
+struct DownloadState {
+    mutex                    mtx;
+    queue<int>               pending;            // chunk indices yet to be downloaded
+    map<int, vector<string>> chunk_availability; // mutable: failed peers are erased
+    atomic<int>              chunks_done{0};
+    atomic<bool>             fatal_error{false};
+    int                      num_chunks = 0;
+};
 
-    string command = "get_chunk$$" + filename + "$$" + to_string(chunkNum) + "$$" + destination;
-    connect_to_peer(&serverPeerIP[0][0], &serverPeerIP[1][0], command);
-    
-    delete reqdChunk;
-    return;
-}
- 
-void piece_selection_algorithm(vector<string> inpt, vector<string> peers){
-    // inpt = [command, group id, filename, destination]
-    ll filesize = stoll(peers.back());
-    peers.pop_back();
-    ll segments = filesize/SEGMENT_SIZE+1;
-    curdown_ch_ind_to_seederlist.clear();
-    curdown_ch_ind_to_seederlist.resize(segments);
+// Like download_chunk but writes with pwrite() instead of fstream::seekp.
+// pwrite() is POSIX-guaranteed atomic for non-overlapping file regions, so
+// multiple threads can write different chunks to the same fd concurrently
+// without any mutex.
+static bool download_chunk_to_fd(const string& peer_addr, const string& filename,
+                                  int chunk_num, int fd, const string& expected_hash) {
+    vector<string> addr_parts = split_string(peer_addr, ":");
+    if (addr_parts.size() != 2) return false;
 
-    write_log("Started piecewise algo");
-    
-    vector<thread> threads, threads2;
- 
-    for(size_t i=0; i<peers.size(); i++){
-        peerFileDetails* pf = new peerFileDetails();
-        pf->filename = inpt[2];
-        pf->serverPeerIP = peers[i];
-        pf->filesize = segments;
-        threads.push_back(thread(get_bit_vector, pf));
-    }
-    for(auto it=threads.begin(); it!=threads.end();it++){
-        if(it->joinable()) it->join();
-    }
-    
-    write_log("filled in default values to file");
-    for(size_t i=0; i<curdown_ch_ind_to_seederlist.size(); i++){
-        if(curdown_ch_ind_to_seederlist[i].size() == 0){
-            cout << "All parts of the file are not available." << endl;
-            return;
-        }
+    int sock = create_socket();
+    if (sock < 0) return false;
+
+    if (connect_to_server(sock, addr_parts[0], stoi(addr_parts[1])) < 0) {
+        close(sock);
+        return false;
     }
 
-    threads.clear();
-    srand((unsigned) time(0));
-    ll segmentsReceived = 0;
+    send_data(sock, "GET_CHUNK$$" + filename + "$$" + to_string(chunk_num));
 
-    string des_path = inpt[3] + "/" + inpt[2];
-    FILE* fp = fopen(&des_path[0], "r+");
-	if(fp != 0){
-		printf("The file already exists.\n") ;
-        fclose(fp);
-        return;
-	}
-    string ss(filesize, '\0');
-    fstream in(&des_path[0],ios::out|ios::binary);
-    in.write(ss.c_str(),strlen(ss.c_str()));  
-    in.close();
-
-    file_to_chunk_bitvector[inpt[2]].resize(segments,0);
-    is_corrupted_file = false;
-
-    vector<int> tmp(segments, 0);
-    file_to_chunk_bitvector[inpt[2]] = tmp;
-    
-    string peerToGetFilepath;
-
-    while(segmentsReceived < segments){
-        write_log("getting segment no: " + to_string(segmentsReceived));
-        
-        ll randompiece;
-        while(true){
-            randompiece = rand()%segments;
-            write_log("randompiece = " + to_string(randompiece));
-            if(file_to_chunk_bitvector[inpt[2]][randompiece] == 0) break;
-        }
-        ll peersWithThisPiece = curdown_ch_ind_to_seederlist[randompiece].size();
-        string randompeer = curdown_ch_ind_to_seederlist[randompiece][rand()%peersWithThisPiece];
-
-        reqdChunkDetails* req = new reqdChunkDetails();
-        req->filename = inpt[2];
-        req->serverPeerIP = randompeer;
-        req->chunkNum = randompiece;
-        req->destination = inpt[3] + "/" + inpt[2];
-
-        write_log("starting thread for chunk number "+ to_string(req->chunkNum));
-        file_to_chunk_bitvector[inpt[2]][randompiece] = 1;
-
-        threads2.push_back(thread(getChunk, req));
-        segmentsReceived++;
-        peerToGetFilepath = randompeer;
-    }    
-    for(auto it=threads2.begin(); it!=threads2.end();it++){
-        if(it->joinable()) it->join();
-    } 
-
-    if(is_corrupted_file){
-        cout << "Downloaded completed. The file may be corrupted." << endl;
-    }
-    else{
-         cout << "Download completed. No corruption detected." << endl;
-    }
-    downloaded_files.insert({inpt[2], inpt[1]});
-
-    vector<string> serverAddress = split_string(peerToGetFilepath, ":");
-    connect_to_peer(&serverAddress[0][0], &serverAddress[1][0], "get_file_path$$" + inpt[2]);
-    return;
-}
- 
-int downloadFile(vector<string> inpt, int sock){
-    // inpt -  download_file​ <group_id> <file_name> <destination_path>
-    if(inpt.size() != 4){
-        return 0;
-    }
-    string fileDetails = "";
-    fileDetails += inpt[2] + "$$";
-    fileDetails += inpt[3] + "$$";
-    fileDetails += inpt[1];
-    // fileDetails = [filename, destination, group id]
-    
-    write_log("sending file details for download : " + fileDetails);
-    if(send(sock , &fileDetails[0] , strlen(&fileDetails[0]) , MSG_NOSIGNAL ) == -1){
-        printf("Error: %s\n",strerror(errno));
-        return -1;
+    string response = recv_data(sock);
+    vector<string> parts = split_string(response);
+    if (parts.size() < 2 || parts[0] != "OK") {
+        close(sock);
+        return false;
     }
 
-    char server_reply[524288] = {0}; 
-    read(sock , server_reply, 524288); 
+    size_t chunk_size = stoul(parts[1]);
+    send_data(sock, "READY");
 
-    if(string(server_reply) == "File not found"){
-        cout << server_reply << endl;
-        return 0;
-    }
-    vector<string> peersWithFile = split_string(server_reply, "$$");
-    
-    char dum[5];
-    strcpy(dum, "test");
-    write(sock, dum, 5);
-
-    bzero(server_reply, 524288);
-    read(sock , server_reply, 524288); 
-
-    vector<string> tmp = split_string(string(server_reply), "$$");
-    cur_file_PiecewiseHash = tmp;
-
-    piece_selection_algorithm(inpt, peersWithFile);
-    return 0;
-}
-
-int uploadFile(vector<string> inpt, int sock){
-    if(inpt.size() != 3){
-            return 0;
-    }
-    string fileDetails = "";
-    char* filepath = &inpt[1][0];
-
-    string filename = split_string(string(filepath), "/").back();
-
-    if(is_uploaded[inpt[2]].find(filename) != is_uploaded[inpt[2]].end()){
-        cout << "File already uploaded" << endl;
-        if(send(sock , "error" , 5 , MSG_NOSIGNAL ) == -1){
-            printf("Error: %s\n",strerror(errno));
-            return -1;
-        }
-        return 0;
-    }
-    else{
-        is_uploaded[inpt[2]][filename] = true;
-        file_name_to_filePath[filename] = string(filepath);
-    }
-
-    string piecewiseHash = cal_hash(filepath);
-
-    if(piecewiseHash == "$") return 0;
-    string filehash = cal_file_hash(filepath);
-    string filesize = to_string(file_size(filepath));
-
-    fileDetails += string(filepath) + "$$";
-    fileDetails += string(peer_ip) + ":" + to_string(peer_port) + "$$";
-    fileDetails += filesize + "$$";
-    fileDetails += filehash + "$$";
-    fileDetails += piecewiseHash;
-    
-    write_log("sending file details for upload: " + fileDetails);
-    if(send(sock , &fileDetails[0] , strlen(&fileDetails[0]) , MSG_NOSIGNAL ) == -1){
-        printf("Error: %s\n",strerror(errno));
-        return -1;
-    }
-    
-    char server_reply[10240] = {0}; 
-    read(sock , server_reply, 10240); 
-    cout << server_reply << endl;
-    write_log("server reply for send file: " + string(server_reply));
-
-    update_file_chunk_bitvector(filename, 0, stoll(filesize)/SEGMENT_SIZE + 1, true);
-
-    return 0;
-}
-
-
-// *************************************************************************************************************************
-
-int main(int argc, char* argv[]){
-    
-    if(argc != 3){
-        cout << "Give arguments as <peer IP:port> and <tracker info file name>\n";
-        return -1;
-    }
-    configure_trackerinfo(argc, argv);
-
-    int sock = 0; 
-    struct sockaddr_in serv_addr; 
-    pthread_t serverThread;
-    
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {  
-        printf("\n Socket creation error \n"); 
-        return -1; 
-    } 
-    write_log("Peer socket created");
-
-    if(pthread_create(&serverThread, NULL, run_as_server, NULL) == -1){
-        perror("pthread"); 
-        exit(EXIT_FAILURE); 
-    }
-
-    if(connect_to_tracker(1, serv_addr, sock) < 0){
-        exit(-1); 
-    }
-    while(true){ 
-        cout << ">> ";
-        string inptline, s;
-        getline(cin, inptline);
-
-        if(inptline.length() < 1) continue;
-        
-        stringstream ss(inptline);
-        vector<string> inpt;
-        while(ss >> s){
-            inpt.push_back(s);
-        } 
-
-        if(inpt[0] == "login" && is_loggedin){
-            cout << "You already have one active session" << endl;
-            continue;
-        }
-        if(inpt[0] != "login" && inpt[0] != "create_user" && !is_loggedin){
-             cout << "Please login / create an account" << endl;
-                continue;
-        }
-
-        if(send(sock , &inptline[0] , strlen(&inptline[0]) , MSG_NOSIGNAL ) == -1){
-            printf("Error: %s\n",strerror(errno));
-            return -1;
-        }
-        write_log("sent to server: " + inpt[0]);
-
-        process_tracker_command(inpt, sock);
+    vector<char> buffer(chunk_size);
+    size_t received = 0;
+    while (received < chunk_size) {
+        ssize_t n = recv(sock, buffer.data() + received, chunk_size - received, 0);
+        if (n <= 0) { close(sock); return false; }
+        received += n;
     }
     close(sock);
-    return 0; 
+
+    // Verify SHA1 of this chunk
+    string actual_hash = sha1_hash(string(buffer.data(), chunk_size));
+    if (actual_hash != expected_hash) {
+        log_error("Hash mismatch for chunk " + to_string(chunk_num));
+        return false;
+    }
+
+    // Write at the exact file offset — no seek, no lock needed
+    ssize_t written = pwrite(fd, buffer.data(), chunk_size,
+                             static_cast<off_t>(chunk_num) * CHUNK_SIZE);
+    return written == static_cast<ssize_t>(chunk_size);
+}
+
+// Worker: drain the shared pending queue.  On failure, blacklist the peer
+// for that chunk and re-queue it so another worker (or this one) retries
+// with a different peer.
+static void download_worker(const string& filename, int fd,
+                            const vector<string>& piece_hash_list,
+                            DownloadState& state) {
+    thread_local mt19937 rng(random_device{}());
+
+    while (!state.fatal_error) {
+        int    chunk_idx = -1;
+        string selected_peer;
+
+        {
+            lock_guard<mutex> lock(state.mtx);
+            if (state.pending.empty()) break;
+
+            chunk_idx = state.pending.front();
+            state.pending.pop();
+
+            auto& peers = state.chunk_availability[chunk_idx];
+            if (peers.empty()) {
+                state.fatal_error = true;
+                return;
+            }
+            uniform_int_distribution<size_t> dist(0, peers.size() - 1);
+            selected_peer = peers[dist(rng)];
+        }
+
+        const string& expected_hash = (chunk_idx < (int)piece_hash_list.size())
+                                       ? piece_hash_list[chunk_idx] : "";
+
+        if (download_chunk_to_fd(selected_peer, filename, chunk_idx, fd, expected_hash)) {
+            int done = ++state.chunks_done;
+            lock_guard<mutex> lock(log_mutex);
+            cout << "\rProgress: " << done << "/" << state.num_chunks
+                 << " chunks (" << (done * 100 / state.num_chunks) << "%)" << flush;
+        } else {
+            lock_guard<mutex> lock(state.mtx);
+            auto& peers = state.chunk_availability[chunk_idx];
+            peers.erase(remove(peers.begin(), peers.end(), selected_peer), peers.end());
+            if (peers.empty()) {
+                log_error("Chunk " + to_string(chunk_idx) + " has no remaining peers");
+                state.fatal_error = true;
+            } else {
+                state.pending.push(chunk_idx);  // retry with a different peer
+            }
+        }
+    }
+}
+
+/**
+ * Download file from peers using parallel chunk download.
+ * Phase 1: bitvector queries run concurrently (one future per peer).
+ * Phase 2: up to MAX_PARALLEL_DOWNLOADS worker threads drain the chunk queue.
+ */
+bool download_file_from_peers(const string& filename, const string& dest_path,
+                               const vector<string>& seeders, long long filesize,
+                               const vector<string>& piece_hash_list) {
+    int num_chunks = (filesize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    cout << "Downloading " << filename << " (" << filesize << " bytes, "
+         << num_chunks << " chunks)" << endl;
+
+    // --- Phase 1: fetch bitvectors from all peers in parallel ---
+    map<int, vector<string>> chunk_availability;
+    {
+        vector<pair<string, future<string>>> bv_futures;
+        bv_futures.reserve(seeders.size());
+        for (const string& peer : seeders) {
+            bv_futures.emplace_back(peer,
+                async(launch::async, get_peer_bitvector, peer, filename));
+        }
+        for (auto& [peer, fut] : bv_futures) {
+            string bitvector = fut.get();
+            for (size_t i = 0; i < bitvector.size() && i < (size_t)num_chunks; i++) {
+                if (bitvector[i] == '1')
+                    chunk_availability[i].push_back(peer);
+            }
+        }
+    }
+
+    // Ensure every chunk has at least one source before we start
+    for (int i = 0; i < num_chunks; i++) {
+        if (chunk_availability[i].empty()) {
+            log_error("Chunk " + to_string(i) + " not available from any peer");
+            return false;
+        }
+    }
+
+    // --- Pre-allocate destination file ---
+    {
+        ofstream file(dest_path, ios::binary);
+        if (!file.is_open()) {
+            log_error("Cannot create destination file: " + dest_path);
+            return false;
+        }
+        if (filesize > 0) {
+            file.seekp(filesize - 1);
+            file.write("\0", 1);
+        }
+    }
+
+    // Open a raw fd so workers can use pwrite() without serialising on a seek
+    int fd = open(dest_path.c_str(), O_RDWR);
+    if (fd < 0) {
+        perror("open destination file");
+        return false;
+    }
+
+    // --- Phase 2: parallel chunk download ---
+    DownloadState state;
+    state.num_chunks         = num_chunks;
+    state.chunk_availability = chunk_availability;
+    for (int i = 0; i < num_chunks; i++) state.pending.push(i);
+
+    int num_workers = min({(int)seeders.size(), MAX_PARALLEL_DOWNLOADS, num_chunks});
+    cout << "Launching " << num_workers << " parallel worker(s)..." << endl;
+
+    vector<future<void>> futures;
+    futures.reserve(num_workers);
+    for (int i = 0; i < num_workers; i++) {
+        futures.push_back(async(launch::async, download_worker,
+                                cref(filename), fd,
+                                cref(piece_hash_list), ref(state)));
+    }
+    for (auto& f : futures) f.get();  // wait for all workers
+
+    close(fd);
+    cout << endl;  // newline after the \r progress line
+
+    if (state.fatal_error || state.chunks_done.load() < num_chunks) {
+        log_error("Download incomplete: " +
+                  to_string(state.chunks_done.load()) + "/" + to_string(num_chunks));
+        return false;
+    }
+
+    cout << "Download complete!" << endl;
+
+    // Mark every chunk as owned so our peer server can serve this file immediately
+    {
+        lock_guard<mutex> lock(file_mutex);
+        shared_files[filename] = dest_path;
+        file_chunks[filename]  = vector<bool>(num_chunks, true);
+        file_hashes[filename]  = piece_hash_list;
+    }
+
+    return true;
+}
+
+// ==================== TRACKER COMMUNICATION ====================
+
+/**
+ * Send command to tracker and get response
+ */
+string send_to_tracker(int tracker_socket, const string& command) {
+    if (send_data(tracker_socket, command) < 0) {
+        return "ERROR$$Failed to send to tracker";
+    }
+    
+    string response = recv_data(tracker_socket);
+    if (response.empty()) {
+        return "ERROR$$No response from tracker";
+    }
+    
+    return response;
+}
+
+/**
+ * Parse tracker response
+ * Returns: pair<status, message>
+ */
+pair<string, string> parse_response(const string& response) {
+    vector<string> parts = split_string(response);
+    if (parts.size() >= 2) {
+        return {parts[0], parts[1]};
+    }
+    return {"ERROR", response};
+}
+
+/**
+ * Handle upload_file command
+ */
+void handle_upload(int tracker_socket, const string& filepath, const string& group_id) {
+    // Check file exists
+    if (!path_exists(filepath)) {
+        cout << "Error: File not found: " << filepath << endl;
+        return;
+    }
+    
+    string filename = get_filename(filepath);
+    long long filesize = get_file_size(filepath);
+    
+    // Send command to tracker
+    string cmd = "upload_file " + filepath + " " + group_id;
+    string response = send_to_tracker(tracker_socket, cmd);
+    
+    auto [status, message] = parse_response(response);
+    
+    if (status == "ERROR:") {
+        cout << "Error: " << message << endl;
+        return;
+    }
+    
+    if (message == "SEND_FILE_DETAILS") {
+        // Calculate hashes
+        cout << "Calculating file hashes..." << endl;
+        vector<string> piece_hash_list = calculate_piece_hashes(filepath);
+        string piecewise_hash = join_string(piece_hash_list, ",");
+        string filehash = sha256_hash(piecewise_hash);
+        
+        // Send file details: filename$$filesize$$filehash$$piecehashes
+        string details = filename + DELIMITER + 
+                        to_string(filesize) + DELIMITER + 
+                        filehash + DELIMITER + 
+                        piecewise_hash;
+        
+        send_data(tracker_socket, details);
+        
+        // Get final response
+        response = recv_data(tracker_socket);
+        auto [final_status, final_msg] = parse_response(response);
+        
+        if (final_status == "OK") {
+            cout << "File uploaded successfully!" << endl;
+            
+            // Update our state
+            lock_guard<mutex> lock(file_mutex);
+            shared_files[filename] = filepath;
+            
+            int num_chunks = (filesize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            file_chunks[filename] = vector<bool>(num_chunks, true);
+            file_hashes[filename] = piece_hash_list;
+        } else {
+            cout << "Error: " << final_msg << endl;
+        }
+    } else {
+        cout << status << " " << message << endl;
+    }
+}
+
+/**
+ * Handle download_file command
+ */
+void handle_download(int tracker_socket, const string& group_id, 
+                     const string& filename, const string& dest_path) {
+    // Check destination directory exists
+    if (!is_directory(dest_path)) {
+        cout << "Error: Destination directory not found: " << dest_path << endl;
+        return;
+    }
+    
+    string full_dest_path = dest_path + "/" + filename;
+    
+    // Check if file already exists
+    if (path_exists(full_dest_path)) {
+        cout << "Error: File already exists at destination" << endl;
+        return;
+    }
+    
+    // Send command to tracker
+    string cmd = "download_file " + group_id + " " + filename + " " + dest_path;
+    string response = send_to_tracker(tracker_socket, cmd);
+    
+    auto [status, message] = parse_response(response);
+    
+    if (status == "ERROR:") {
+        cout << "Error: " << message << endl;
+        return;
+    }
+    
+    // Parse seeder list response
+    // Format: SEEDER_LIST$$seeder1,seeder2,...$$filesize$$piecehashes$$filehash
+    vector<string> parts = split_string(response);
+
+    if (parts.size() < 6 || parts[1] != "SEEDER_LIST") {
+        cout << "Error: Invalid response from tracker" << endl;
+        return;
+    }
+
+    vector<string> seeders = split_string(parts[2], ",");
+    long long filesize = stoll(parts[3]);
+    vector<string> piece_hash_list = split_string(parts[4], ",");
+    string expected_filehash = parts[5];
+
+    cout << "Found " << seeders.size() << " seeder(s)" << endl;
+
+    // Download from peers
+    if (download_file_from_peers(filename, full_dest_path, seeders, filesize, piece_hash_list)) {
+        // Verify whole-file integrity: sha256 of the joined piece hashes must match
+        string actual_filehash = sha256_hash(join_string(piece_hash_list, ","));
+        if (actual_filehash != expected_filehash) {
+            cout << "Error: File integrity check failed (hash mismatch). Deleting." << endl;
+            remove(full_dest_path.c_str());
+            return;
+        }
+
+        // Download verified — now register with the tracker as a seeder
+        string reg_response = send_to_tracker(tracker_socket,
+                                              "register_seeder " + group_id + " " + filename);
+        auto [reg_status, reg_msg] = parse_response(reg_response);
+        if (reg_status != "OK") {
+            log_error("Warning: could not register as seeder: " + reg_msg);
+        }
+
+        downloaded_files[filename] = group_id;
+        cout << "File saved to: " << full_dest_path << endl;
+    } else {
+        cout << "Download failed" << endl;
+        // Clean up partial file
+        remove(full_dest_path.c_str());
+    }
+}
+
+/**
+ * Show downloads status
+ */
+void show_downloads() {
+    if (downloaded_files.empty()) {
+        cout << "No downloads yet" << endl;
+        return;
+    }
+    
+    cout << "Downloaded files:" << endl;
+    for (const auto& [filename, group] : downloaded_files) {
+        cout << "  [" << group << "] " << filename << endl;
+    }
+}
+
+// ==================== MAIN CLIENT LOOP ====================
+
+void print_help() {
+    cout << "\n=== P2P File Sharing Client ===" << endl;
+    cout << "Commands:" << endl;
+    cout << "  create_user <username> <password>" << endl;
+    cout << "  login <username> <password>" << endl;
+    cout << "  logout" << endl;
+    cout << "  create_group <group_id>" << endl;
+    cout << "  join_group <group_id>" << endl;
+    cout << "  leave_group <group_id>" << endl;
+    cout << "  list_groups" << endl;
+    cout << "  list_requests <group_id>" << endl;
+    cout << "  accept_request <group_id> <user_id>" << endl;
+    cout << "  change_admin <group_id> <new_admin_id>" << endl;
+    cout << "  list_files <group_id>" << endl;
+    cout << "  upload_file <filepath> <group_id>" << endl;
+    cout << "  download_file <group_id> <filename> <dest_path>" << endl;
+    cout << "  stop_share <group_id> <filename>" << endl;
+    cout << "  show_downloads" << endl;
+    cout << "  help" << endl;
+    cout << "  quit" << endl;
+    cout << endl;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 5) {
+        cerr << "Usage: " << argv[0] << " <client_ip> <client_port> <tracker_ip> <tracker_port>" << endl;
+        cerr << "Example: " << argv[0] << " 192.168.1.101 6000 192.168.1.100 5000" << endl;
+        return 1;
+    }
+    
+    my_ip = argv[1];
+    my_port = stoi(argv[2]);
+    tracker_ip = argv[3];
+    tracker_port = stoi(argv[4]);
+    
+    log_info("Starting P2P Client...");
+    log_info("Client: " + my_ip + ":" + to_string(my_port));
+    log_info("Tracker: " + tracker_ip + ":" + to_string(tracker_port));
+    
+    // Start peer server in background
+    thread server_thread(run_peer_server);
+    server_thread.detach();
+    
+    // Connect to tracker
+    int tracker_socket = create_socket();
+    if (tracker_socket < 0) {
+        return 1;
+    }
+    
+    if (connect_to_server(tracker_socket, tracker_ip, tracker_port) < 0) {
+        log_error("Failed to connect to tracker");
+        close(tracker_socket);
+        return 1;
+    }
+    
+    log_info("Connected to tracker");
+    print_help();
+    
+    // Main command loop
+    string line;
+    while (true) {
+        cout << ">> ";
+        cout.flush();
+        
+        if (!getline(cin, line)) break;
+        
+        line = trim(line);
+        if (line.empty()) continue;
+        
+        // Parse command
+        istringstream iss(line);
+        vector<string> args;
+        string word;
+        while (iss >> word) {
+            args.push_back(word);
+        }
+        
+        if (args.empty()) continue;
+        
+        string command = args[0];
+        
+        // Handle local commands
+        if (command == "quit" || command == "exit") {
+            break;
+        }
+        else if (command == "help") {
+            print_help();
+            continue;
+        }
+        else if (command == "show_downloads") {
+            show_downloads();
+            continue;
+        }
+        
+        // Check login for protected commands
+        if (!is_logged_in && command != "create_user" && command != "login") {
+            cout << "Please login first" << endl;
+            continue;
+        }
+        
+        // Already logged in check
+        if (is_logged_in && command == "login") {
+            cout << "Already logged in as " << current_user << endl;
+            continue;
+        }
+        
+        // Handle special commands
+        if (command == "upload_file") {
+            if (args.size() != 3) {
+                cout << "Usage: upload_file <filepath> <group_id>" << endl;
+                continue;
+            }
+            handle_upload(tracker_socket, args[1], args[2]);
+            continue;
+        }
+        else if (command == "download_file") {
+            if (args.size() != 4) {
+                cout << "Usage: download_file <group_id> <filename> <dest_path>" << endl;
+                continue;
+            }
+            handle_download(tracker_socket, args[1], args[2], args[3]);
+            continue;
+        }
+        
+        // Send command to tracker
+        string response = send_to_tracker(tracker_socket, line);
+        auto [status, message] = parse_response(response);
+        
+        // Handle login specially
+        if (command == "login" && message == "LOGIN_OK") {
+            // Send our address to tracker
+            send_data(tracker_socket, my_ip + ":" + to_string(my_port));
+            
+            // Get final response
+            response = recv_data(tracker_socket);
+            auto [final_status, final_msg] = parse_response(response);
+            
+            if (final_status == "OK") {
+                is_logged_in = true;
+                current_user = args[1];
+                cout << "Login successful! Welcome, " << current_user << endl;
+            } else {
+                cout << "Login failed: " << final_msg << endl;
+            }
+            continue;
+        }
+        
+        // Handle logout
+        if (command == "logout" && status == "OK") {
+            is_logged_in = false;
+            current_user.clear();
+        }
+        
+        // Handle stop_share locally
+        if (command == "stop_share" && status == "OK" && args.size() >= 3) {
+            lock_guard<mutex> lock(file_mutex);
+            string filename = args[2];
+            shared_files.erase(filename);
+            file_chunks.erase(filename);
+        }
+        
+        // Print response
+        if (status == "OK") {
+            if (command == "list_groups" || command == "list_files" || command == "list_requests") {
+                // Parse comma-separated list
+                vector<string> items = split_string(message, ",");
+                for (const string& item : items) {
+                    cout << "  " << item << endl;
+                }
+            } else {
+                cout << message << endl;
+            }
+        } else {
+            cout << "Error: " << message << endl;
+        }
+    }
+    
+    // Cleanup
+    server_running = false;
+    close(tracker_socket);
+    
+    log_info("Client shutdown");
+    return 0;
 }

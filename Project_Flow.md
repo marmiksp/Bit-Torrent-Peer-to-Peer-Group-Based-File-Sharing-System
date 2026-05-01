@@ -1,4 +1,4 @@
-# P2P File Sharing System — Complete Reference
+# P2P Bit-Torrent File Sharing System — Complete Reference
 
 This document is the single source of truth for understanding how the BitTorrent-style
 P2P file sharing system works — from the big picture down to individual bytes on the wire.
